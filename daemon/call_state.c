@@ -1,0 +1,2412 @@
+/*
+ * Copyright (C) 2026 Sipwise GmbH / RTPEngine Project
+ *
+ * call_state.c - Core Call State Serialization, Restoration, and Snapshots
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "call_state.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <inttypes.h>
+#include <glib.h>
+#include <glib-object.h>
+#include <json-glib/json-glib.h>
+
+#include "compat.h"
+#include "helpers.h"
+#include "auxlib.h"
+#include "obj.h"
+#include "call.h"
+#include "ice.h"
+#include "str.h"
+#include "crypto.h"
+#include "dtls.h"
+#include "recording.h"
+#include "rtplib.h"
+#include "ssrc.h"
+#include "codec.h"
+#include "sdp.h"
+#include "log_d.h"
+#include "media_socket.h"
+#include "control_ng.h"
+#include "bencode.h"
+#include "main.h"
+
+typedef union {
+	GQueue *q;
+	stream_fd_q *sfds_q;
+	medias_arr *ma;
+	sfd_intf_list_q *siq;
+	packet_stream_q *psq;
+	endpoint_map_q *emq;
+} callback_arg_t __attribute__ ((__transparent_union__));
+
+#define rlog(l, x...) ilog(l | LOG_FLAG_RESTORE, x)
+
+static mutex_t call_ports_release_lock = MUTEX_STATIC_INIT;
+static cond_t call_ports_release_cond = COND_STATIC_INIT;
+static int call_ports_release_balance = 0; // negative = releasers, positive = allocators
+
+void call_ports_release_push(bool inc) {
+	LOCK(&call_ports_release_lock);
+	if (inc) {
+		while (call_ports_release_balance < 0)
+			cond_wait(&call_ports_release_cond, &call_ports_release_lock);
+	}
+	else {
+		while (call_ports_release_balance > 0)
+			cond_wait(&call_ports_release_cond, &call_ports_release_lock);
+	}
+	call_ports_release_balance += (inc ? 1 : -1);
+}
+
+void call_ports_release_pop(bool inc) {
+	LOCK(&call_ports_release_lock);
+	call_ports_release_balance -= (inc ? 1 : -1);
+	if (call_ports_release_balance == 0)
+		cond_broadcast(&call_ports_release_cond);
+}
+
+static __thread const ng_parser_t *redis_parser = &ng_parser_json;
+static const ng_parser_t *const redis_format_parsers[__REDIS_FORMAT_MAX] = {
+	&ng_parser_native,
+	&ng_parser_json,
+};
+
+static int json_build_ssrc(struct call_media *, parser_arg arg);
+
+INLINE long long parser_get_ll(parser_arg arg, const char *key) {
+	return redis_parser->dict_get_int_str(arg, key, -1);
+}
+
+static const char *json_get_hash_iter(const ng_parser_t *parser, str *key, parser_arg val_a, helper_arg arg) {
+	str val;
+	if (!parser->get_str(val_a, &val)) {
+		rlog(LOG_ERROR, "Could not read json member: " STR_FORMAT, STR_FMT(key));
+		return NULL;
+	}
+
+	// XXX convert to proper str ht
+	char *tmp = __g_memdup(key->s, key->len + 1);
+	tmp[key->len] = '\0';
+	// XXX eliminate string dup? eliminate URI decode?
+	if (g_hash_table_insert(arg.ht, tmp, parser->unescape(val.s, val.len)) != TRUE)
+		rlog(LOG_WARNING,"Key %s already exists", tmp);
+
+	return NULL;
+}
+
+int redis_hash_from_parser(struct redis_hash *out, const ng_parser_t *parser, parser_arg dict) {
+	out->ht = g_hash_table_new_full(g_str_hash, g_str_equal, free, free);
+	if (!out->ht)
+		return -1;
+	parser->dict_iter(parser, dict, json_get_hash_iter, out->ht);
+	return 0;
+}
+
+static int json_get_hash(struct redis_hash *out,
+		const char *key, unsigned int id, parser_arg root)
+{
+	static unsigned int MAXKEYLENGTH = 512;
+	char key_concatted[MAXKEYLENGTH];
+	int rc=0;
+
+	if (id == -1) {
+		rc = snprintf(key_concatted, MAXKEYLENGTH, "%s",key);
+	} else {
+		rc = snprintf(key_concatted, MAXKEYLENGTH, "%s-%u",key,id);
+	}
+	if (rc>=MAXKEYLENGTH) {
+		rlog(LOG_ERROR,"Json key too long.");
+		return -1;
+	}
+
+	parser_arg dict = redis_parser->dict_get_expect(root, key_concatted, BENCODE_DICTIONARY);
+	if (!dict.gen) {
+		rlog(LOG_ERROR, "Could not read json member: %s",key_concatted);
+		return -1;
+	}
+
+	return redis_hash_from_parser(out, redis_parser, dict);
+}
+
+void redis_hash_destroy(struct redis_hash *rh) {
+        g_hash_table_destroy(rh->ht);
+}
+
+static void json_destroy_list(struct redis_list *rl) {
+        unsigned int i;
+
+        for (i = 0; i < rl->len; i++) {
+                redis_hash_destroy(&rl->rh[i]);
+        }
+        free(rl->rh);
+        free(rl->ptrs);
+}
+
+static int redis_hash_get_str(str *out, const struct redis_hash *h, const char *k) {
+	str *r;
+
+	r = g_hash_table_lookup(h->ht, k);
+	if (!r) {
+		out->s = NULL;
+		out->len = 0;
+		return -1;
+	}
+	*out = *r;
+	return 0;
+}
+
+/* we can do this because this happens during startup in a single thread */
+static atomic64 strtoa64(const char *c, char **endp, int base) {
+	uint64_t u;
+	atomic64 ret;
+
+	u = strtoull(c, endp, base);
+	atomic64_set_na(&ret, u);
+	return ret;
+}
+
+static int64_t time_t_conv(const char *c, char **endp, int base) {
+	// hack for compatibility - to be removed XXX
+	int64_t us = strtoll(c, endp, base);
+	if (us < 4000000LL)
+		return us * 1000000L;
+	return us;
+}
+
+
+
+#define define_get_int_type(name, type, func)								\
+	static int redis_hash_get_ ## name(type *out, const struct redis_hash *h, const char *k) {	\
+		str* s;										\
+													\
+		s = g_hash_table_lookup(h->ht, k);							\
+		if (!s)											\
+			return -1;									\
+		*out = func(s->s, NULL, 10);								\
+		return 0;										\
+	}
+
+
+
+define_get_int_type(time_t, int64_t, time_t_conv);
+define_get_int_type(int64_t, int64_t, strtoll);
+define_get_int_type(int, int, strtol);
+define_get_int_type(llu, unsigned long long, strtoll);
+define_get_int_type(ld, long, strtoll);
+define_get_int_type(unsigned, unsigned int, strtol);
+//define_get_int_type(u16, uint16_t, strtol);
+//define_get_int_type(u64, uint64_t, strtoull);
+define_get_int_type(a64, atomic64, strtoa64);
+
+
+
+
+#define define_get_type_format(name, type)									\
+	static int redis_hash_get_ ## name ## _v(type *out, const struct redis_hash *h, const char *f,		\
+			va_list ap)										\
+	{													\
+		char key[64];											\
+														\
+		vsnprintf(key, sizeof(key), f, ap);								\
+		return redis_hash_get_ ## name(out, h, key);							\
+	}													\
+	static int redis_hash_get_ ## name ## _f(type *out, const struct redis_hash *h, const char *f, ...) {	\
+		va_list ap;											\
+		int ret;											\
+														\
+		va_start(ap, f);										\
+		ret = redis_hash_get_ ## name ## _v(out, h, f, ap);						\
+		va_end(ap);											\
+		return ret;											\
+	}
+
+
+
+define_get_type_format(str, str);
+define_get_type_format(int, int);
+//define_get_type_format(unsigned, unsigned int);
+//define_get_type_format(u16, uint16_t);
+//define_get_type_format(u64, uint64_t);
+define_get_type_format(a64, atomic64);
+
+static int redis_hash_get_c_buf_fn(unsigned char *out, size_t len, const struct redis_hash *h,
+		const char *k, ...)
+{
+	va_list ap;
+	str s;
+	int ret;
+
+	va_start(ap, k);
+	ret = redis_hash_get_str_v(&s, h, k, ap);
+	va_end(ap);
+	if (ret)
+		return -1;
+	if (s.len > len)
+		return -1;
+
+	memcpy(out, s.s, s.len);
+
+	return 0;
+}
+
+#define redis_hash_get_c_buf_f(o, h, f...) \
+		redis_hash_get_c_buf_fn(o, sizeof(o), h, f)
+
+static int redis_hash_get_bool_flag(const struct redis_hash *h, const char *k) {
+	int i;
+
+	if (redis_hash_get_int(&i, h, k))
+		return 0;
+	if (i)
+		return -1;
+	return 0;
+}
+
+static int redis_hash_get_endpoint(struct endpoint *out, const struct redis_hash *h, const char *k) {
+	str s;
+
+	if (redis_hash_get_str(&s, h, k))
+		return -1;
+	if (!endpoint_parse_any(out, s.s))
+		return -1;
+
+	return 0;
+}
+define_get_type_format(endpoint, struct endpoint);
+
+static int redis_hash_get_stats(struct stream_stats *out, const struct redis_hash *h, const char *k) {
+	if (redis_hash_get_a64_f(&out->packets, h, "%s-packets", k))
+		return -1;
+	if (redis_hash_get_a64_f(&out->bytes, h, "%s-bytes", k))
+		return -1;
+	if (redis_hash_get_a64_f(&out->errors, h, "%s-errors", k))
+		return -1;
+	return 0;
+}
+static void *redis_list_get_idx_ptr(struct redis_list *list, unsigned int idx) {
+	if (idx >= list->len)
+		return NULL;
+	return list->ptrs[idx];
+}
+static void *redis_list_get_ptr(struct redis_list *list, struct redis_hash *rh, const char *key) {
+	unsigned int idx;
+	if (redis_hash_get_unsigned(&idx, rh, key))
+		return NULL;
+	return redis_list_get_idx_ptr(list, idx);
+}
+
+struct cb_iter_ptrs { // XXX remove this?
+	int (*cb)(str *, callback_arg_t, struct redis_list *, void *);
+	callback_arg_t cb_arg;
+	struct redis_list *list;
+	void *ptr;
+};
+
+static const char *json_build_list_cb_iter(str *val, unsigned int i, helper_arg arg) {
+	struct cb_iter_ptrs *args = arg.generic;
+	str *s = redis_parser->unescape(val->s, val->len);
+	args->cb(s, args->cb_arg, args->list, args->ptr);
+	g_free(s);
+	return NULL;
+}
+
+static int json_build_list_cb(callback_arg_t q, call_t *c, const char *key,
+		unsigned int idx, struct redis_list *list,
+		int (*cb)(str *, callback_arg_t, struct redis_list *, void *), void *ptr, parser_arg arg)
+{
+	char key_concatted[256];
+
+	snprintf(key_concatted, 256, "%s-%u", key, idx);
+
+	parser_arg r_list = redis_parser->dict_get_expect(arg, key_concatted, BENCODE_LIST);
+	if (!r_list.gen) {
+		rlog(LOG_ERROR,"Key in json not found:%s",key_concatted);
+		return -1;
+	}
+	struct cb_iter_ptrs args = {
+		.cb = cb,
+		.cb_arg = q,
+		.list = list,
+		.ptr = ptr,
+	};
+	redis_parser->list_iter(redis_parser, r_list, json_build_list_cb_iter, NULL, &args);
+	return 0;
+}
+
+static int rbl_cb_simple(str *s, callback_arg_t qp, struct redis_list *list, void *ptr) {
+	GQueue *q = qp.q;
+	int j;
+	j = str_to_i(s, 0);
+	g_queue_push_tail(q, redis_list_get_idx_ptr(list, (unsigned) j));
+	return 0;
+}
+
+static int rbpa_cb_simple(str *s, callback_arg_t pap, struct redis_list *list, void *ptr) {
+	medias_arr *pa = pap.ma;
+	int j;
+	j = str_to_i(s, 0);
+	t_ptr_array_add(pa, redis_list_get_idx_ptr(list, (unsigned) j));
+	return 0;
+}
+
+static int json_build_list(callback_arg_t q, call_t *c, const char *key,
+		unsigned int idx, struct redis_list *list, parser_arg arg)
+{
+	return json_build_list_cb(q, c, key, idx, list, rbl_cb_simple, NULL, arg);
+}
+
+static int json_build_ptra(medias_arr *q, call_t *c, const char *key,
+		unsigned int idx, struct redis_list *list, parser_arg arg)
+{
+	return json_build_list_cb(q, c, key, idx, list, rbpa_cb_simple, NULL, arg);
+}
+
+static int json_get_list_hash(struct redis_list *out,
+		const char *key,
+		const struct redis_hash *rh, const char *rh_num_key, parser_arg arg)
+{
+	unsigned int i;
+
+	if (redis_hash_get_unsigned(&out->len, rh, rh_num_key))
+		return -1;
+	out->rh = malloc(sizeof(*out->rh) * out->len);
+	if (!out->rh)
+		return -1;
+	out->ptrs = malloc(sizeof(*out->ptrs) * out->len);
+	if (!out->ptrs)
+		goto err1;
+
+	for (i = 0; i < out->len; i++) {
+		if (json_get_hash(&out->rh[i], key, i, arg))
+			goto err2;
+	}
+
+	return 0;
+
+err2:
+	free(out->ptrs);
+	while (i) {
+		i--;
+		redis_hash_destroy(&out->rh[i]);
+	}
+err1:
+	free(out->rh);
+	return -1;
+}
+
+/* can return 1, 0 or -1 */
+static int redis_hash_get_sdes_params1(struct crypto_params *out, const struct redis_hash *h, const char *k) {
+	str s;
+	int i;
+	const char *err;
+
+	if (redis_hash_get_str_f(&s, h, "%s-crypto_suite", k))
+		return 1;
+	out->crypto_suite = crypto_find_suite(&s);
+	err = "crypto suite not known";
+	if (!out->crypto_suite)
+		goto err;
+
+	err = "master_key";
+	if (redis_hash_get_c_buf_f(out->master_key, h, "%s-master_key", k))
+		goto err;
+	err = "master_salt";
+	if (redis_hash_get_c_buf_f(out->master_salt, h, "%s-master_salt", k))
+		goto err;
+
+	if (!redis_hash_get_str_f(&s, h, "%s-mki", k)) {
+		err = "mki too long";
+		if (s.len > 255)
+			return -1;
+		out->mki = malloc(s.len);
+		memcpy(out->mki, s.s, s.len);
+		out->mki_len = s.len;
+	}
+
+	if (!redis_hash_get_int_f(&i, h, "%s-unenc-srtp", k))
+		out->session_params.unencrypted_srtp = i;
+	if (!redis_hash_get_int_f(&i, h, "%s-unenc-srtcp", k))
+		out->session_params.unencrypted_srtcp = i;
+	if (!redis_hash_get_int_f(&i, h, "%s-unauth-srtp", k))
+		out->session_params.unauthenticated_srtp = i;
+
+	return 0;
+
+err:
+	rlog(LOG_ERR, "Crypto params error: %s", err);
+	return -1;
+}
+int redis_decode_sdes_params(sdes_q *out, const struct redis_hash *h, const char *k) {
+	char key[32], tagkey[64];
+	const char *kk = k;
+	unsigned int tag;
+	unsigned int iter = 0;
+
+	while (1) {
+		snprintf(tagkey, sizeof(tagkey), "%s_tag", kk);
+		if (redis_hash_get_unsigned(&tag, h, tagkey))
+			break;
+		struct crypto_params_sdes *cps = g_new0(__typeof(*cps), 1);
+		cps->tag = tag;
+		int ret = redis_hash_get_sdes_params1(&cps->params, h, kk);
+		if (ret) {
+			g_free(cps);
+			if (ret == 1)
+				return 0;
+			return -1;
+		}
+
+		t_queue_push_tail(out, cps);
+		snprintf(key, sizeof(key), "%s-%u", k, iter++);
+		kk = key;
+	}
+	return 0;
+}
+
+int redis_decode_dtls_fingerprint(struct dtls_fingerprint *out, const struct redis_hash *h) {
+	str hash;
+	if (redis_hash_get_str(&hash, h, "hash_func"))
+		return 0;
+	out->hash_func = dtls_find_hash_func(&hash);
+	if (!out->hash_func || redis_hash_get_c_buf_f(out->digest, h, "fingerprint"))
+		return -1;
+	out->digest_len = out->hash_func->num_bytes;
+	return 0;
+}
+
+static int redis_sfds(call_t *c, struct redis_list *sfds) {
+	unsigned int i;
+	str family, intf_name;
+	struct redis_hash *rh;
+	sockfamily_t *fam;
+	struct logical_intf *lif;
+	struct local_intf *loc;
+	unsigned int loc_uid;
+	stream_fd *sfd;
+	int port, fd;
+	const char *err;
+
+	for (i = 0; i < sfds->len; i++) {
+		rh = &sfds->rh[i];
+
+		if (redis_hash_get_int(&fd, rh, "fd"))
+			fd = 0;
+		err = "'localport' key not present";
+		if (redis_hash_get_int(&port, rh, "localport"))
+			goto err;
+		err = "'pref_family' key not present";
+		if (redis_hash_get_str(&family, rh, "pref_family"))
+			goto err;
+		err = "'logical_intf' key not present";
+		if (redis_hash_get_str(&intf_name, rh, "logical_intf"))
+			goto err;
+		err = "'local_intf_uid' key not present";
+		if (redis_hash_get_unsigned(&loc_uid, rh, "local_intf_uid"))
+			goto err;
+
+		err = "socket family not known";
+		fam = get_socket_family_rfc(&family);
+		if (!fam)
+			goto err;
+		err = "logical interface not known";
+		lif = get_logical_interface(&intf_name, fam, 0);
+		if (!lif)
+			goto err;
+		err = "not enough local interfaces";
+		loc = t_queue_peek_nth(&lif->list, loc_uid);
+		if (!loc)
+			goto err;
+
+		if (fd != -1) {
+			err = "failed to open ports";
+			__auto_type spl = get_specific_port(port, loc->spec, &c->callid);
+			if (!spl.socket.family)
+				goto err;
+			set_tos(&spl.socket, c->tos);
+			sfd = stream_fd_new(&spl, c, loc);
+		}
+		else {
+			struct socket_port_link spl = {0};
+			dummy_socket(&spl.socket, &loc->spec->local_address.addr);
+			sfd = stream_fd_new(&spl, c, loc);
+		}
+
+		if (redis_hash_get_sdes_params1(&sfd->crypto.params, rh, "") == -1)
+			return -1;
+
+		sfds->ptrs[i] = sfd;
+	}
+	return 0;
+
+err:
+	rlog(LOG_ERR, "Error creating sfd: %s", err);
+	return -1;
+}
+
+static int redis_decode_stream_fields(struct packet_stream *ps, const struct redis_hash *rh) {
+	if (redis_hash_get_a64(&ps->ps_flags, rh, "ps_flags"))
+		return -1;
+	if (redis_hash_get_endpoint(&ps->endpoint, rh, "endpoint"))
+		return -1;
+	if (redis_hash_get_endpoint(&ps->advertised_endpoint, rh, "advertised_endpoint"))
+		return -1;
+	return 0;
+}
+
+static int redis_streams(call_t *c, struct redis_list *streams) {
+	unsigned int i;
+	struct redis_hash *rh;
+	struct packet_stream *ps;
+
+	for (i = 0; i < streams->len; i++) {
+		rh = &streams->rh[i];
+
+		ps = __packet_stream_new(c);
+		if (!ps)
+			return -1;
+
+		atomic64_set_na(&ps->last_packet_us, now_us());
+		if (redis_decode_stream_fields(ps, rh))
+			return -1;
+		if (redis_hash_get_unsigned((unsigned int *) &ps->component, rh, "component"))
+			return -1;
+		if (redis_hash_get_stats(ps->stats_in, rh, "stats"))
+			return -1;
+		if (redis_hash_get_sdes_params1(&ps->crypto.params, rh, "") == -1)
+			return -1;
+
+		streams->ptrs[i] = ps;
+	}
+	return 0;
+}
+
+static void redis_decode_monologue_sdp(struct call_monologue *ml, const struct redis_hash *rh) {
+	str s;
+	long il;
+	/* s= */
+	if (!redis_hash_get_str(&s, rh, "sdp_session_name"))
+		ml->sdp_session_name = call_str_cpy(&s);
+	/* t= */
+	if (!redis_hash_get_str(&s, rh, "sdp_session_timing"))
+		ml->sdp_session_timing = call_str_cpy(&s);
+	/* o= */
+	if (!redis_hash_get_str(&s, rh, "sdp_orig_parsed")) {
+		ml->sdp_orig_in.parsed = 1;
+		redis_hash_get_llu(&ml->sdp_orig_in.version_num, rh, "sdp_orig_version_num");
+		if (!redis_hash_get_str(&s, rh, "sdp_orig_username"))
+			ml->sdp_orig_in.username = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "sdp_orig_session_id"))
+			ml->sdp_orig_in.session_id = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "sdp_orig_address_network_type"))
+			ml->sdp_orig_in.address.network_type = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "sdp_orig_address_address_type"))
+			ml->sdp_orig_in.address.address_type = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "sdp_orig_address_address"))
+			ml->sdp_orig_in.address.address = call_str_cpy(&s);
+	}
+	/* o= last used of the other side*/
+	if (!redis_hash_get_str(&s, rh, "last_sdp_orig_parsed")) {
+		ml->sdp_orig_out.parsed = 1;
+		redis_hash_get_llu(&ml->sdp_orig_out.version_num, rh, "last_sdp_orig_version_num");
+		if (!redis_hash_get_str(&s, rh, "last_sdp_orig_username"))
+			ml->sdp_orig_out.username = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "last_sdp_orig_session_id"))
+			ml->sdp_orig_out.session_id = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "last_sdp_orig_address_network_type"))
+			ml->sdp_orig_out.address.network_type = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "last_sdp_orig_address_address_type"))
+			ml->sdp_orig_out.address.address_type = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "last_sdp_orig_address_address"))
+			ml->sdp_orig_out.address.address = call_str_cpy(&s);
+	}
+
+	ml->sdp_session_bandwidth.as = (!redis_hash_get_ld(&il, rh, "sdp_session_as")) ? il : -1;
+	ml->sdp_session_bandwidth.ct = (!redis_hash_get_ld(&il, rh, "sdp_session_ct")) ? il : -1;
+	ml->sdp_session_bandwidth.rr = (!redis_hash_get_ld(&il, rh, "sdp_session_rr")) ? il : -1;
+	ml->sdp_session_bandwidth.rs = (!redis_hash_get_ld(&il, rh, "sdp_session_rs")) ? il : -1;
+	ml->sdp_session_bandwidth.tias = (!redis_hash_get_ld(&il, rh, "sdp_session_tias")) ? il : -1;
+}
+
+static int redis_tags(call_t *c, struct redis_list *tags, parser_arg arg) {
+	unsigned int i;
+	int ii;
+	atomic64 a64;
+	struct redis_hash *rh;
+	struct call_monologue *ml;
+	str s;
+
+	for (i = 0; i < tags->len; i++) {
+		rh = &tags->rh[i];
+
+		ml = __monologue_create(c, &c->callid);
+		if (!ml)
+			return -1;
+
+		if (redis_hash_get_time_t(&ml->created_us, rh, "created"))
+			return -1;
+		if (!redis_hash_get_str(&s, rh, "tag"))
+			__monologue_tag(ml, &s);
+		if (!redis_hash_get_str(&s, rh, "call_id"))
+			ml->call_id = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "via-branch"))
+			__monologue_viabranch(ml, &s);
+		if (!redis_hash_get_str(&s, rh, "label"))
+			ml->label = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, rh, "metadata"))
+			ml->metadata = call_str_cpy(&s);
+		redis_hash_get_time_t(&ml->deleted_us, rh, "deleted");
+		if (!redis_hash_get_int(&ii, rh, "block_dtmf"))
+			ml->block_dtmf = ii;
+		if (!redis_hash_get_a64(&a64, rh, "ml_flags"))
+			ml->ml_flags = a64;
+
+		redis_decode_monologue_sdp(ml, rh);
+
+		if (redis_hash_get_str(&s, rh, "desired_family"))
+			return -1;
+		ml->desired_family = get_socket_family_rfc(&s);
+
+		if (redis_hash_get_str(&s, rh, "logical_intf")
+				|| !(ml->logical_intf = get_logical_interface(&s, ml->desired_family, 0)))
+		{
+			rlog(LOG_ERR, "unable to find specified local interface");
+			ml->logical_intf = get_logical_interface(NULL, ml->desired_family, 0);
+		}
+
+		tags->ptrs[i] = ml;
+	}
+
+	return 0;
+}
+
+static rtp_payload_type *rbl_cb_plts_g(str *s, struct redis_list *list, void *ptr) {
+	str ptype;
+	struct call_media *med = ptr;
+
+	if (!str_token(&ptype, s, '/'))
+		return NULL;
+
+	rtp_payload_type *pt = codec_make_payload_type(s, med->type_id);
+	if (!pt)
+		return NULL;
+
+	pt->payload_type = str_to_i(&ptype, 0);
+
+	return pt;
+}
+static const char *redis_decode_codec_iter(str *value, unsigned int i, helper_arg arg) {
+	struct codec_store *store = arg.generic;
+	str *decoded = redis_parser->unescape(value->s, value->len);
+	struct call_media *media = store->media;
+	rtp_payload_type *pt = rbl_cb_plts_g(decoded, NULL, media);
+	g_free(decoded);
+	if (!pt)
+		return "invalid payload type";
+	codec_store_add_raw(store, pt);
+	return NULL;
+}
+
+int redis_decode_codec_store(const ng_parser_t *parser, parser_arg list, struct codec_store *store) {
+	const ng_parser_t *saved = redis_parser;
+	redis_parser = parser;
+	const char *err = parser->list_iter(parser, list, redis_decode_codec_iter, NULL, store);
+	redis_parser = saved;
+	return err ? -1 : 0;
+}
+
+static int redis_decode_media_fields(struct call_media *med, const struct redis_hash *rh) {
+	str s;
+	long il;
+
+	if (redis_hash_get_int(&med->ptime, rh, "ptime"))
+		return -1;
+	if (redis_hash_get_int(&med->maxptime, rh, "maxptime"))
+		return -1;
+	if (redis_hash_get_str(&s, rh, "protocol"))
+		return -1;
+	med->protocol = transport_protocol(&s);
+	if (redis_hash_get_str(&s, rh, "desired_family"))
+		return -1;
+	med->desired_family = get_socket_family_rfc(&s);
+
+	med->format_str = !redis_hash_get_str(&s, rh, "format_str") ? call_str_cpy(&s) : STR_NULL;
+
+	/* bandwidth data is not critical */
+	med->sdp_media_bandwidth.as = (!redis_hash_get_ld(&il, rh, "bandwidth_as")) ? il : -1;
+	med->sdp_media_bandwidth.rr = (!redis_hash_get_ld(&il, rh, "bandwidth_rr")) ? il : -1;
+	med->sdp_media_bandwidth.rs = (!redis_hash_get_ld(&il, rh, "bandwidth_rs")) ? il : -1;
+	return 0;
+}
+
+static int json_medias(call_t *c, struct redis_list *medias, struct redis_list *tags,
+		parser_arg arg)
+{
+	unsigned int i;
+	struct redis_hash *rh;
+	struct call_media *med;
+	str s;
+
+	for (i = 0; i < medias->len; i++) {
+		rh = &medias->rh[i];
+
+		/* from call.c:__get_media() */
+		med = call_media_new(c);
+
+		if (redis_hash_get_unsigned(&med->index, rh, "index"))
+			return -1;
+		if (redis_hash_get_str(&s, rh, "type"))
+			return -1;
+		med->type = call_str_cpy(&s);
+		med->type_id = codec_get_type(&med->type);
+		if (!redis_hash_get_str(&s, rh, "media_id"))
+			med->media_id = call_str_cpy(&s);
+
+		if (redis_decode_media_fields(med, rh))
+			return -1;
+
+		if (!redis_hash_get_str(&s, rh, "logical_intf")
+				&& !(med->logical_intf = get_logical_interface(&s, med->desired_family, 0)))
+		{
+			rlog(LOG_ERR, "unable to find specified local interface");
+			med->logical_intf = get_logical_interface(NULL, med->desired_family, 0);
+		}
+
+		if (redis_hash_get_a64(&med->media_flags, rh,
+					"media_flags"))
+			return -1;
+
+		if (redis_decode_sdes_params(&med->sdes_in, rh, "sdes_in") < 0)
+			return -1;
+		if (redis_decode_sdes_params(&med->sdes_out, rh, "sdes_out") < 0)
+			return -1;
+
+
+		char payload_key[64];
+		snprintf(payload_key, sizeof(payload_key), "payload_types-%u", i);
+		parser_arg payloads = redis_parser->dict_get_expect(arg, payload_key, BENCODE_LIST);
+		if (payloads.gen && redis_decode_codec_store(redis_parser, payloads, &med->codecs))
+			return -1;
+		/* XXX dtls */
+
+		/* link monologue */
+		med->monologue = redis_list_get_ptr(tags, &medias->rh[i], "tag");
+
+		if (json_build_ssrc(med, arg))
+			return -1;
+
+		medias->ptrs[i] = med;
+	}
+
+	return 0;
+}
+
+static int redis_maps(call_t *c, struct redis_list *maps) {
+	unsigned int i;
+	struct redis_hash *rh;
+	struct endpoint_map *em;
+	str s, t;
+	sockfamily_t *fam;
+
+	for (i = 0; i < maps->len; i++) {
+		rh = &maps->rh[i];
+
+		/* from call.c:__get_endpoint_map() */
+		em = uid_alloc(&c->endpoint_maps);
+		t_queue_init(&em->intf_sfds);
+
+		em->wildcard = redis_hash_get_bool_flag(rh, "wildcard");
+		if (redis_hash_get_unsigned(&em->num_ports, rh, "num_ports"))
+			return -1;
+		if (redis_hash_get_str(&t, rh, "intf_preferred_family"))
+			return -1;
+		fam = get_socket_family_rfc(&t);
+		if (!fam)
+			return -1;
+		if (redis_hash_get_str(&s, rh, "logical_intf")
+				|| !(em->logical_intf = get_logical_interface(&s, fam, 0)))
+		{
+			rlog(LOG_ERR, "unable to find specified local interface");
+			em->logical_intf = get_logical_interface(NULL, fam, 0);
+		}
+		if (redis_hash_get_endpoint(&em->endpoint, rh, "endpoint"))
+			return -1;
+
+		maps->ptrs[i] = em;
+	}
+
+	return 0;
+}
+
+static int redis_link_sfds(struct redis_list *sfds, struct redis_list *streams) {
+	unsigned int i;
+	stream_fd *sfd;
+
+	for (i = 0; i < sfds->len; i++) {
+		sfd = sfds->ptrs[i];
+
+		sfd->stream = redis_list_get_ptr(streams, &sfds->rh[i], "stream");
+		if (!sfd->stream)
+			return -1;
+	}
+
+	return 0;
+}
+
+/**
+ * Supports only `media-subscriptions-*` structures.
+ * Restores media subscriptions based on:
+ * `unique_id`, `offer_answer`, `rtcp_only`, `egress`, `inject`
+ */
+static int rbl_subs_cb(str *s, callback_arg_t dummy, struct redis_list *list, void *ptr) {
+	str token;
+
+	if (!str_token_sep(&token, s, '/'))
+		return -1;
+
+	unsigned int media_unique_id = str_to_i(&token, 0);
+
+	bool offer_answer = false;
+	bool rtcp_only = false;
+	bool egress = false;
+	bool inject = false;
+
+	if (str_token_sep(&token, s, '/')) {
+		offer_answer = str_to_i(&token, 0) ? true : false;
+		if (str_token_sep(&token, s, '/')) {
+			rtcp_only = str_to_i(&token, 0) ? true : false;
+			if (str_token_sep(&token, s, '/')) {
+				egress = str_to_i(&token, 0) ? true : false;
+				if (str_token_sep(&token, s, '/'))
+					inject = str_to_i(&token, 0) ? true : false;
+			}
+		}
+	}
+
+	struct call_media *media = ptr;
+	struct call_media *other_media = redis_list_get_idx_ptr(list, media_unique_id);
+	if (!other_media)
+		return -1;
+
+	add_media_subscription(media, other_media,
+						&(struct sink_attrs) {
+						.offer_answer = offer_answer,
+						.rtcp_only = rtcp_only,
+						.egress = egress,
+						.inject = inject,
+					});
+
+	codec_handlers_update(other_media, media, .reset_transcoding = true);
+
+	return 0;
+}
+
+static int cb_tag_aliases(str *s, callback_arg_t dummy, struct redis_list *list, void *ptr) {
+	struct call_monologue *ml = ptr;
+	t_queue_push_tail(&ml->tag_aliases, call_str_dup(s));
+	return 0;
+}
+
+static int json_link_tags(call_t *c, struct redis_list *tags, struct redis_list *medias, parser_arg arg)
+{
+	unsigned int i;
+	struct call_monologue *ml, *other_ml;
+	GQueue q = G_QUEUE_INIT;
+	GList *l;
+
+	for (i = 0; i < tags->len; i++)
+	{
+		ml = tags->ptrs[i];
+
+		char key_subscriptions[256], key_subscriptions_oa[256], key_subscriptions_noa[256];
+		snprintf(key_subscriptions, 256, "subscriptions-%u", i);
+		snprintf(key_subscriptions_oa, 256, "subscriptions-oa-%u", i);
+		snprintf(key_subscriptions_noa, 256, "subscriptions-noa-%u", i);
+
+		/* Legacy */
+		if (redis_parser->dict_contains(arg, key_subscriptions))
+			rlog(LOG_DEBUG, "Outdated format used to restore subscriptions (older rtpengine ver.), will be dropped.");
+
+		if (redis_parser->dict_contains(arg, key_subscriptions_oa))
+			rlog(LOG_DEBUG, "Outdated format used to restore subscriptions (older rtpengine ver.), will be dropped.");
+
+		if (redis_parser->dict_contains(arg, key_subscriptions_noa))
+			rlog(LOG_DEBUG, "Outdated format used to restore subscriptions (older rtpengine ver.), will be dropped.");
+
+		/* associated tags */
+		if (json_build_list(&q, c, "associated_tags", i, tags, arg))
+			return -1;
+		for (l = q.head; l; l = l->next)
+		{
+			other_ml = l->data;
+			if (!other_ml)
+			    return -1;
+			g_hash_table_insert(ml->associated_tags, other_ml, other_ml);
+		}
+		g_queue_clear(&q);
+
+		json_build_list_cb(NULL, c, "tag_aliases", i, NULL, cb_tag_aliases, ml, arg);
+
+		if (json_build_ptra(ml->medias, c, "medias", i, medias, arg))
+			return -1;
+	}
+
+	return 0;
+}
+
+static struct media_subscription *__find_media_subscriber(struct call_media *media, struct packet_stream *sink) {
+	if (!media || !sink || !sink->media)
+		return NULL;
+
+	struct call_monologue * find_ml = sink->media->monologue;
+
+	IQUEUE_FOREACH(&media->media_subscribers, ms) {
+		if (find_ml == ms->monologue)
+			return ms;
+	}
+
+	return NULL;
+}
+
+static int json_link_streams(call_t *c, struct redis_list *streams,
+		struct redis_list *sfds, struct redis_list *medias, parser_arg arg)
+{
+	unsigned int i;
+	struct packet_stream *ps;
+	GQueue q = G_QUEUE_INIT;
+	GList *l;
+
+	for (i = 0; i < streams->len; i++) {
+		ps = streams->ptrs[i];
+		struct call_media *media = ps->media;
+
+		ps->media = redis_list_get_ptr(medias, &streams->rh[i], "media");
+		ps->selected_sfd = redis_list_get_ptr(sfds, &streams->rh[i], "sfd");
+		ps->rtcp_sibling = redis_list_get_ptr(streams, &streams->rh[i], "rtcp_sibling");
+
+		if (json_build_list(&ps->sfds, c, "stream_sfds", i, sfds, arg))
+			return -1;
+		for (__auto_type sfd_link = ps->sfds.head; sfd_link; sfd_link = sfd_link->next)
+			stream_fd_inc(sfd_link->data);
+
+		if (json_build_list(&q, c, "rtp_sinks", i, streams, arg))
+			return -1;
+		for (l = q.head; l; l = l->next) {
+			struct packet_stream *sink = l->data;
+			if (!sink)
+				return -1;
+			struct media_subscription *ms = __find_media_subscriber(media, sink);
+			if (ms && ms->attrs.egress)
+				continue;
+			struct sink_attrs attrs = { .rtcp_only = !!(ms && ms->attrs.rtcp_only) };
+			__add_sink_handler(&ps->rtp_sinks, sink, &attrs);
+		}
+		g_queue_clear(&q);
+
+		// backwards compatibility
+		if (!ps->rtp_sinks.length) {
+			struct packet_stream *sink = redis_list_get_ptr(streams, &streams->rh[i], "rtp_sink");
+			if (sink)
+				__add_sink_handler(&ps->rtp_sinks, sink, NULL);
+		}
+
+		if (json_build_list(&q, c, "rtcp_sinks", i, streams, arg))
+			return -1;
+		for (l = q.head; l; l = l->next) {
+			struct packet_stream *sink = l->data;
+			if (!sink)
+				return -1;
+			__add_sink_handler(&ps->rtcp_sinks, sink, NULL);
+		}
+		g_queue_clear(&q);
+
+		// backwards compatibility
+		if (!ps->rtcp_sinks.length) {
+			struct packet_stream *sink = redis_list_get_ptr(streams, &streams->rh[i], "rtcp_sink");
+			if (sink)
+				__add_sink_handler(&ps->rtcp_sinks, sink, NULL);
+		}
+
+		if (ps->media)
+			__rtp_stats_update(ps->rtp_stats, &ps->media->codecs);
+
+		__init_stream(ps);
+	}
+
+	return 0;
+}
+
+static int json_link_medias(call_t *c, struct redis_list *medias,
+		struct redis_list *streams, struct redis_list *maps, parser_arg arg)
+{
+	for (unsigned int i = 0; i < medias->len; i++)
+	{
+		struct call_media *med = medias->ptrs[i];
+		if (!med || !med->monologue)
+			continue;
+		if (json_build_list(&med->streams, c, "streams", i, streams, arg))
+			return -1;
+		if (json_build_list(&med->endpoint_maps, c, "maps", i, maps, arg))
+			return -1;
+
+		if (med->media_id.s)
+			t_hash_table_insert(med->monologue->media_ids, &med->media_id, med);
+
+		/* find the pair media to subscribe */
+		if (!json_build_list_cb(NULL, c, "media-subscriptions", med->unique_id,
+					medias, rbl_subs_cb, med, arg))
+		{
+			rlog(LOG_DEBUG, "Restored media subscriptions for: '" STR_FORMAT_M "'", STR_FMT_M(&med->monologue->tag));
+		}
+	}
+	return 0;
+}
+
+static int rbl_cb_intf_sfds(str *s, callback_arg_t qp, struct redis_list *list, void *ptr) {
+	sfd_intf_list_q *q = qp.siq;
+	int i;
+	struct sfd_intf_list *il;
+	struct endpoint_map *em;
+	void *sfd;
+
+	if (!strncmp(s->s, "loc-", 4)) {
+		il = g_new0(__typeof(*il), 1);
+		em = ptr;
+		i = atoi(s->s+4);
+		il->local_intf = g_queue_peek_nth((GQueue*) &em->logical_intf->list, i);
+		if (!il->local_intf)
+			return -1;
+		t_queue_push_tail(q, il);
+		return 0;
+	}
+
+	il = t_queue_peek_tail(q);
+	if (!il)
+		return -1;
+
+	sfd = redis_list_get_idx_ptr(list, atoi(s->s));
+	if (G_UNLIKELY(!sfd))
+	    return -1;
+
+	t_queue_push_tail(&il->list, sfd);
+	return 0;
+}
+
+static int json_link_maps(call_t *c, struct redis_list *maps,
+		struct redis_list *sfds, parser_arg arg)
+{
+	unsigned int i;
+	struct endpoint_map *em;
+
+	for (i = 0; i < maps->len; i++) {
+		em = maps->ptrs[i];
+
+		if (json_build_list_cb(&em->intf_sfds, c, "map_sfds", em->unique_id, sfds,
+				rbl_cb_intf_sfds, em, arg))
+			return -1;
+		for (__auto_type l = em->intf_sfds.head; l; l = l->next) {
+			struct sfd_intf_list *il = l->data;
+			for (__auto_type k = il->list.head; k; k = k->next)
+				stream_fd_inc(k->data);
+		}
+	}
+	return 0;
+}
+
+static const char *json_build_ssrc_iter(const ng_parser_t *parser, parser_arg dict, helper_arg arg) {
+	struct call_media *md = arg.md;
+
+	uint32_t ssrc = parser_get_ll(dict, "ssrc");
+	struct ssrc_entry_call *se_in = get_ssrc(ssrc, &md->ssrc_hash_in);
+	struct ssrc_entry_call *se_out = get_ssrc(ssrc, &md->ssrc_hash_out);
+
+	if (se_in) {
+		atomic_set_na(&se_in->stats->ext_seq, parser_get_ll(dict, "in_srtp_index"));
+		atomic_set_na(&se_in->stats->rtcp_seq, parser_get_ll(dict, "in_srtcp_index"));
+		payload_tracker_add(&se_in->tracker, parser_get_ll(dict, "in_payload_type"));
+		obj_put(&se_in->h);
+	}
+	if (se_out) {
+		atomic_set_na(&se_out->stats->ext_seq, parser_get_ll(dict, "out_srtp_index"));
+		atomic_set_na(&se_out->stats->rtcp_seq, parser_get_ll(dict, "out_srtcp_index"));
+		payload_tracker_add(&se_out->tracker, parser_get_ll(dict, "out_payload_type"));
+		obj_put(&se_out->h);
+	}
+
+	return NULL;
+}
+
+static int json_build_ssrc(struct call_media *md, parser_arg arg) {
+	char tmp[2048];
+	snprintf(tmp, sizeof(tmp), "ssrc_table-%u", md->unique_id);
+	parser_arg list = redis_parser->dict_get_expect(arg, tmp, BENCODE_LIST);
+	if (!list.gen) {
+		// non-fatal for backwards compatibility
+		return 0;
+	}
+	redis_parser->list_iter(redis_parser, list, NULL, json_build_ssrc_iter, md);
+	return 0;
+}
+
+static int checkpoint_get_int(int64_t *out, const struct redis_hash *h, const char *k) {
+	str *s = g_hash_table_lookup(h->ht, k);
+	if (!s || !s->len)
+		return -1;
+	char *end = NULL;
+	errno = 0;
+	long long v = strtoll(s->s, &end, 10);
+	if (errno || !end || end != s->s + s->len)
+		return -1;
+	*out = v;
+	return 0;
+}
+
+static int redis_restore_checkpoints(call_t *c, parser_arg root) {
+	for (__auto_type l = c->monologues.head; l; l = l->next) {
+		struct call_monologue *ml = l->data;
+		struct redis_hash rh;
+		// absent for a call written by a version that had no checkpoints
+		if (json_get_hash(&rh, "checkpoint", ml->unique_id, root))
+			continue;
+
+		int64_t pending = 0;
+		str snap = STR_NULL;
+		int bad = checkpoint_get_int(&pending, &rh, "pending");
+		/* the hash owns its values; copy out before it's destroyed */
+		if (!bad) {
+			str stored;
+			if (!redis_hash_get_str(&stored, &rh, "snapshot"))
+				snap = str_dup_str(&stored);
+		}
+		redis_hash_destroy(&rh);
+		if (bad) {
+			str_free_dup(&snap);
+			return -1;
+		}
+
+		ml->checkpoint = g_new0(__typeof(*ml->checkpoint), 1);
+		ml->checkpoint->pending = pending && snap.len;
+		if (ml->checkpoint->pending)
+			ml->checkpoint->snapshot = snap;
+		else
+			str_free_dup(&snap);
+	}
+	return 0;
+}
+
+struct redis_parsed_record {
+	JsonParser *json;
+	bencode_buffer_t benc;
+	bool benc_valid;
+	const ng_parser_t *parser;
+};
+
+static const char *redis_parse_record(const str *record, parser_arg *root,
+		struct redis_parsed_record *out)
+{
+	ZERO(*out);
+	if (!record->len)
+		return "empty record";
+
+	if (record->s[0] == '{') {
+		out->json = json_parser_new();
+		if (!json_parser_load_from_data(out->json, record->s, record->len, NULL))
+			return "could not parse JSON data";
+		JsonNode *json_root = json_parser_get_root(out->json);
+		if (!json_root)
+			return "could not read JSON data";
+		root->json = json_root;
+		redis_parser = out->parser = &ng_parser_json;
+		return NULL;
+	}
+
+	if (record->s[0] == 'd') {
+		if (bencode_buffer_init(&out->benc))
+			return "failed to initialise bencode buffer";
+		out->benc_valid = true;
+		bencode_item_t *benc_root = bencode_decode_expect_str(&out->benc, record,
+				BENCODE_DICTIONARY);
+		if (!benc_root)
+			return "failed to decode bencode dictionary";
+		root->benc = benc_root;
+		redis_parser = out->parser = &ng_parser_native;
+		return NULL;
+	}
+
+	return "Unrecognised serial format";
+}
+
+static void redis_parsed_record_free(struct redis_parsed_record *p) {
+	if (p->json)
+		g_object_unref(p->json);
+	if (p->benc_valid)
+		bencode_buffer_free(&p->benc);
+}
+
+
+
+int call_restore_from_payload(const str *callid, const str *payload, bool foreign) {
+	struct redis_hash call;
+	struct redis_list tags, sfds, streams, medias, maps;
+	call_t *c = NULL;
+	str s, id;
+	int64_t last_signal;
+
+	const char *err = 0;
+	int i;
+	atomic64 a64;
+	struct redis_parsed_record parsed = {0};
+	parser_arg root = {0};
+
+	if (!payload || !payload->len || !payload->s)
+		return -1;
+
+	bool must_release_pop = true;
+	call_ports_release_push(false);
+
+	err = redis_parse_record(payload, &root, &parsed);
+	if (err)
+		goto err1;
+
+	c = call_get_or_create(callid, false);
+	err = "failed to create call struct";
+	if (!c)
+		goto err1;
+
+	err = "'call' data incomplete";
+	if (json_get_hash(&call, "json", -1, root))
+		goto err2;
+
+	err = "missing 'last signal' timestamp";
+	if (redis_hash_get_time_t(&last_signal, &call, "last_signal"))
+		goto err3;
+
+	if (c->last_signal_us) {
+		err = NULL;
+		// is the call we're loading newer than the one we have?
+		if (last_signal > c->last_signal_us) {
+			// switch ownership
+			call_make_own_foreign(c, foreign);
+			c->last_signal_us = last_signal;
+		}
+		goto err3; // no error, just bail
+	}
+
+	err = "'tags' incomplete";
+	if (json_get_list_hash(&tags, "tag", &call, "num_tags", root))
+		goto err3;
+	err = "'sfds' incomplete";
+	if (json_get_list_hash(&sfds, "sfd", &call, "num_sfds", root))
+		goto err4;
+	err = "'streams' incomplete";
+	if (json_get_list_hash(&streams, "stream", &call, "num_streams", root))
+		goto err5;
+	err = "'medias' incomplete";
+	if (json_get_list_hash(&medias, "media", &call, "num_medias", root))
+		goto err6;
+	err = "'maps' incomplete";
+	if (json_get_list_hash(&maps, "map", &call, "num_maps", root))
+		goto err7;
+
+	err = "missing 'created' timestamp";
+	if (redis_hash_get_int64_t(&c->created, &call, "created"))
+		goto err8;
+	redis_hash_get_int64_t(&c->destroyed, &call, "destroyed");
+	c->last_signal_us = last_signal;
+	if (redis_hash_get_int(&i, &call, "tos"))
+		c->tos = 184;
+	else
+		c->tos = i;
+	redis_hash_get_time_t(&c->deleted_us, &call, "deleted");
+	redis_hash_get_time_t(&c->ml_deleted_us, &call, "ml_deleted");
+	if (!redis_hash_get_str(&id, &call, "created_from"))
+		c->created_from = call_str_cpy(&id);
+	if (!redis_hash_get_int(&i, &call, "block_dtmf"))
+		c->block_dtmf = i;
+	if (!redis_hash_get_a64(&a64, &call, "call_flags"))
+		c->call_flags = a64;
+
+	err = "missing 'redis_hosted_db' value";
+	if (redis_hash_get_unsigned((unsigned int *) &c->redis_hosted_db, &call, "redis_hosted_db"))
+		goto err8;
+
+	err = "failed to create sfds";
+	if (redis_sfds(c, &sfds))
+		goto err8;
+	err = "failed to create streams";
+	if (redis_streams(c, &streams))
+		goto err8;
+	err = "failed to create tags";
+	if (redis_tags(c, &tags, root))
+		goto err8;
+	err = "failed to create medias";
+	if (json_medias(c, &medias, &tags, root))
+		goto err8;
+	err = "failed to create maps";
+	if (redis_maps(c, &maps))
+		goto err8;
+
+	err = "failed to link sfds";
+	if (redis_link_sfds(&sfds, &streams))
+		goto err8;
+	err = "failed to link streams";
+	if (json_link_streams(c, &streams, &sfds, &medias, root))
+		goto err8;
+	err = "failed to link tags";
+	if (json_link_tags(c, &tags, &medias, root))
+		goto err8;
+	err = "failed to link medias";
+	if (json_link_medias(c, &medias, &streams, &maps, root))
+		goto err8;
+	err = "failed to link maps";
+	if (json_link_maps(c, &maps, &sfds, root))
+		goto err8;
+	if (redis_restore_checkpoints(c, root)) {
+		/* auxiliary state: an unreadable payload disables rollback rather than
+		 * discarding an otherwise usable call */
+		call_checkpoint_free_all(c);
+		ilog(LOG_WARNING, "Ignoring invalid checkpoint data while restoring call");
+	}
+
+	// presence of this key determines whether we were recording at all
+	if (!redis_hash_get_str(&s, &call, "recording_meta_prefix")) {
+		c->recording_meta_prefix = call_str_cpy(&s);
+		// coverity[check_return : FALSE]
+		redis_hash_get_str(&s, &call, "recording_metadata");
+		c->metadata = call_str_cpy(&s);
+		redis_hash_get_str(&s, &call, "recording_file");
+		c->recording_file = call_str_cpy(&s);
+		redis_hash_get_str(&s, &call, "recording_path");
+		c->recording_path = call_str_cpy(&s);
+		redis_hash_get_str(&s, &call, "recording_pattern");
+		c->recording_pattern = call_str_cpy(&s);
+		redis_hash_get_str(&s, &call, "recording_random_tag");
+		c->recording_random_tag = call_str_cpy(&s);
+		recording_start_daemon(c);
+	}
+
+	// force-clear foreign flag (could have been set through call_flags), then
+	// set it to what we want, updating the statistics if needed
+	CALL_CLEAR(c, FOREIGN);
+	call_make_own_foreign(c, foreign);
+	bf_set_clear(&c->call_flags, CALL_FLAG_MEDIA_COUNTED, false);
+	statistics_update_ip46_inc_dec(c, CMC_INCREMENT);
+
+	err = NULL;
+
+err8:
+	json_destroy_list(&maps);
+err7:
+	json_destroy_list(&medias);
+err6:
+	json_destroy_list(&streams);
+err5:
+	json_destroy_list(&sfds);
+err4:
+	json_destroy_list(&tags);
+err3:
+	redis_hash_destroy(&call);
+err2:
+	rwlock_unlock_w(&c->master_lock);
+
+	if (err)
+		goto err_fail;
+
+	if (must_release_pop)
+		call_ports_release_pop(false);
+	log_info_reset();
+	redis_parsed_record_free(&parsed);
+	if (c)
+		obj_put(c);
+	return 0;
+
+err1:
+err_fail:
+	if (err)
+		rlog(LOG_WARNING, "Failed to restore call ID '" STR_FORMAT_M "': %s",
+				STR_FMT_M(callid), err);
+	if (c)
+		call_destroy(c);
+	release_closed_sockets();
+	if (must_release_pop)
+		call_ports_release_pop(false);
+	if (c)
+		obj_put(c);
+	log_info_reset();
+	redis_parsed_record_free(&parsed);
+	return -1;
+}
+
+#define JSON_ADD_LIST_STRING(f,...) do { \
+		size_t len = rtpe_snprintf(tmp,sizeof(tmp), f, __VA_ARGS__); \
+		char enc[len * 3 + 1]; \
+		str encstr = parser->escape(enc, tmp, len); \
+		parser->list_add_str_dup(inner, &encstr); \
+	} while (0)
+#define JSON_SET_NSTRING(a,b,c,...) do { \
+		char tmp1[128]; \
+		size_t len = rtpe_snprintf(tmp1, sizeof(tmp1), c, __VA_ARGS__); \
+		char enc[len * 3 + 1]; \
+		str encstr = parser->escape(enc, tmp1, len); \
+		char tmp2[256]; \
+		snprintf(tmp2, sizeof(tmp2), a, b); \
+		parser->dict_add_str_dup_dup(inner, tmp2, &encstr); \
+	} while (0)
+#define JSON_SET_NSTRING_CSTR(a,b,d) JSON_SET_NSTRING_LEN(a, b, strlen(d), d)
+#define JSON_SET_NSTRING_LEN(a,b,l,d) do { \
+		char enc[l * 3 + 1]; \
+		str encstr = parser->escape(enc, d, l); \
+		char tmp[256]; \
+		snprintf(tmp, sizeof(tmp), a, b); \
+		parser->dict_add_str_dup_dup(inner, tmp, &encstr); \
+	} while (0)
+#define JSON_SET_SIMPLE(a,c,...) do { \
+		char tbuf[128]; \
+		size_t len = rtpe_snprintf(tbuf, sizeof(tbuf), c, __VA_ARGS__); \
+		char enc[len * 3 + 1]; \
+		str encstr = parser->escape(enc, tbuf, len); \
+		parser->dict_add_str_dup(inner, a, &encstr); \
+	} while (0)
+#define JSON_SET_SIMPLE_LEN(a,l,d) do { \
+		char enc[l * 3 + 1]; \
+		str encstr = parser->escape(enc, d, l); \
+		parser->dict_add_str_dup(inner, a, &encstr); \
+	} while (0)
+#define JSON_SET_SIMPLE_CSTR(a,d) parser->dict_add_str_dup(inner, a, STR_PTR(d))
+#define JSON_SET_SIMPLE_STR(a,d) parser->dict_add_str_dup(inner, a, d)
+
+void redis_encode_codec_store(const ng_parser_t *parser, parser_arg list,
+		const struct codec_store *store)
+{
+	char tmp[1024];
+	for (auto_iter(l, store->codec_prefs.head); l; l = l->next) {
+		rtp_payload_type *pt = l->data;
+		size_t len = rtpe_snprintf(tmp, sizeof(tmp), "%u/" STR_FORMAT "/%u/" STR_FORMAT
+				"/%i/%i/" STR_FORMAT "/" STR_FORMAT,
+				pt->payload_type, STR_FMT(&pt->encoding), pt->clock_rate,
+				STR_FMT(&pt->encoding_parameters), pt->bitrate, pt->ptime,
+				STR_FMT(&pt->format_parameters), STR_FMT(&pt->codec_opts));
+		char encoded[len * 3 + 1];
+		str value = parser->escape(encoded, tmp, len);
+		parser->list_add_str_dup(list, &value);
+	}
+}
+
+static void json_update_crypto_params(const ng_parser_t *parser, parser_arg inner,
+		const char *key, struct crypto_params *p)
+{
+	if (!p->crypto_suite)
+		return;
+
+	JSON_SET_NSTRING_CSTR("%s-crypto_suite", key, p->crypto_suite->name);
+	JSON_SET_NSTRING_LEN("%s-master_key", key, sizeof(p->master_key), (char *) p->master_key);
+	JSON_SET_NSTRING_LEN("%s-master_salt", key, sizeof(p->master_salt), (char *) p->master_salt);
+
+	JSON_SET_NSTRING("%s-unenc-srtp", key, "%i", p->session_params.unencrypted_srtp);
+	JSON_SET_NSTRING("%s-unenc-srtcp", key, "%i", p->session_params.unencrypted_srtcp);
+	JSON_SET_NSTRING("%s-unauth-srtp", key, "%i", p->session_params.unauthenticated_srtp);
+
+	if (p->mki)
+		JSON_SET_NSTRING_LEN("%s-mki", key, p->mki_len, (char *) p->mki);
+}
+
+int redis_encode_sdes_params(const ng_parser_t *parser, parser_arg inner, const char *k,
+		const sdes_q *q)
+{
+	unsigned int iter = 0;
+	char keybuf[32];
+	const char *key = k;
+
+	for (auto_iter(l, q->head); l; l = l->next) {
+		struct crypto_params_sdes *cps = l->data;
+		struct crypto_params *p = &cps->params;
+
+		if (!p->crypto_suite)
+			return -1;
+
+		JSON_SET_NSTRING("%s_tag", key, "%u", cps->tag);
+		json_update_crypto_params(parser, inner, key, p);
+
+		snprintf(keybuf, sizeof(keybuf), "%s-%u", k, iter++);
+		key = keybuf;
+	}
+
+	return 0;
+}
+
+void redis_encode_dtls_fingerprint(const ng_parser_t *parser, parser_arg inner,
+		const struct dtls_fingerprint *f)
+{
+	if (!f->hash_func)
+		return;
+
+	JSON_SET_SIMPLE_CSTR("hash_func",f->hash_func->name);
+	JSON_SET_SIMPLE_LEN("fingerprint", sizeof(f->digest), (char *) f->digest);
+}
+
+static void json_update_detected_endpoints(const ng_parser_t *parser, parser_arg inner,
+		const struct packet_stream *ps)
+{
+	/* NSTRING: the key is built at runtime, so the parser must duplicate it */
+	for (unsigned int i = 0; i < G_N_ELEMENTS(ps->detected_endpoints); i++)
+		JSON_SET_NSTRING_CSTR("detected_endpoint-%u", i,
+				ps->detected_endpoints[i].address.family
+				? endpoint_print_buf(&ps->detected_endpoints[i]) : "");
+}
+
+/**
+ * encodes the few (k,v) pairs for one call under one json structure
+ */
+
+
+// scope = write only these monologues' state, plus the state only a rollback
+// reads. NULL writes the whole call, which is what the Redis record wants.
+static bool ml_in_scope(struct call_monologue * const *scope, const struct call_monologue *ml) {
+	return !scope || ml == scope[0] || ml == scope[1];
+}
+
+static str redis_encode_json(ng_parser_ctx_t *ctx, call_t *c, void **to_free,
+		struct call_monologue * const *scope)
+{
+
+	char tmp[128];
+	const ng_parser_t *parser = ctx->parser;
+
+	parser_arg root = parser->dict(ctx);
+
+	{
+		parser_arg inner = {0};
+
+		if (!scope) {
+			inner = parser->dict_add_dict(root, "json");
+			JSON_SET_SIMPLE("created","%" PRId64, c->created);
+			JSON_SET_SIMPLE("destroyed","%" PRId64, c->destroyed);
+			JSON_SET_SIMPLE("last_signal","%" PRId64, c->last_signal_us);
+			JSON_SET_SIMPLE("tos","%u", (int) c->tos);
+			JSON_SET_SIMPLE("deleted","%" PRId64, c->deleted_us);
+			JSON_SET_SIMPLE("num_sfds","%u", t_queue_get_length(&c->stream_fds));
+			JSON_SET_SIMPLE("num_streams","%u", t_queue_get_length(&c->streams));
+			JSON_SET_SIMPLE("num_medias","%u", t_queue_get_length(&c->medias));
+			JSON_SET_SIMPLE("num_tags","%u", t_queue_get_length(&c->monologues));
+			JSON_SET_SIMPLE("num_maps","%u", t_queue_get_length(&c->endpoint_maps));
+			JSON_SET_SIMPLE("ml_deleted","%" PRId64, c->ml_deleted_us);
+			JSON_SET_SIMPLE("redis_hosted_db","%u", c->redis_hosted_db);
+			JSON_SET_SIMPLE_STR("recording_metadata", &c->metadata);
+			JSON_SET_SIMPLE("block_dtmf","%i", c->block_dtmf);
+			JSON_SET_SIMPLE("call_flags", "%" PRIu64, atomic64_get_na(&c->call_flags));
+
+			if (c->created_from.len)
+				JSON_SET_SIMPLE_STR("created_from", &c->created_from);
+			if (c->recording_meta_prefix.len)
+				JSON_SET_SIMPLE_STR("recording_meta_prefix", &c->recording_meta_prefix);
+			if (c->recording_file.len)
+				JSON_SET_SIMPLE_STR("recording_file", &c->recording_file);
+			if (c->recording_path.len)
+				JSON_SET_SIMPLE_STR("recording_path", &c->recording_path);
+			if (c->recording_pattern.len)
+				JSON_SET_SIMPLE_STR("recording_pattern", &c->recording_pattern);
+			if (c->recording_random_tag.len)
+				JSON_SET_SIMPLE_STR("recording_random_tag", &c->recording_random_tag);
+		}
+
+		for (__auto_type l = scope ? NULL : c->monologues.head; l; l = l->next) {
+			const struct call_monologue *ml = l->data;
+			if (!ml->checkpoint)
+				continue;
+			snprintf(tmp, sizeof(tmp), "checkpoint-%u", ml->unique_id);
+			inner = parser->dict_add_dict_dup(root, tmp);
+			JSON_SET_SIMPLE("pending", "%i", ml->checkpoint->pending ? 1 : 0);
+			if (ml->checkpoint->snapshot.len) {
+				/* nested as a string; heap buffer rather than a VLA, as escape() can
+				 * need up to 3x the input */
+				char *enc = g_malloc_n(ml->checkpoint->snapshot.len + 1, 3);
+				str encs = parser->escape(enc, ml->checkpoint->snapshot.s,
+						ml->checkpoint->snapshot.len);
+				parser->dict_add_str_dup(inner, "snapshot", &encs);
+				g_free(enc);
+			}
+		}
+
+		for (__auto_type l = scope ? NULL : c->stream_fds.head; l; l = l->next) {
+			stream_fd *sfd = l->data;
+
+			snprintf(tmp, sizeof(tmp), "sfd-%u", sfd->unique_id);
+			inner = parser->dict_add_dict_dup(root, tmp);
+
+			{
+				JSON_SET_SIMPLE_CSTR("pref_family", sfd->local_intf->logical->preferred_family->rfc_name);
+				JSON_SET_SIMPLE("localport","%u", sfd->socket.local.port);
+				JSON_SET_SIMPLE("fd", "%i", sfd->socket.fd);
+				JSON_SET_SIMPLE_STR("logical_intf", &sfd->local_intf->logical->name);
+				JSON_SET_SIMPLE("local_intf_uid","%u", sfd->local_intf->unique_id);
+				JSON_SET_SIMPLE("stream","%u", sfd->stream->unique_id);
+
+				json_update_crypto_params(parser, inner, "", &sfd->crypto.params);
+			}
+
+		} // --- for
+
+		for (__auto_type l = c->streams.head; l; l = l->next) {
+			struct packet_stream *ps = l->data;
+
+			if (!ps->media || !ml_in_scope(scope, ps->media->monologue))
+				continue;
+
+			LOCK(&ps->lock);
+
+			snprintf(tmp, sizeof(tmp), "stream-%u", ps->unique_id);
+			inner = parser->dict_add_dict_dup(root, tmp);
+
+			{
+				JSON_SET_SIMPLE("media","%u",ps->media->unique_id);
+				JSON_SET_SIMPLE("sfd","%u",ps->selected_sfd ? ps->selected_sfd->unique_id : -1);
+				JSON_SET_SIMPLE("rtcp_sibling","%u",ps->rtcp_sibling ? ps->rtcp_sibling->unique_id : -1);
+				JSON_SET_SIMPLE("ps_flags", "%" PRIu64, atomic64_get_na(&ps->ps_flags));
+				JSON_SET_SIMPLE("component","%u",ps->component);
+				JSON_SET_SIMPLE_CSTR("endpoint",endpoint_print_buf(&ps->endpoint));
+				JSON_SET_SIMPLE_CSTR("advertised_endpoint",endpoint_print_buf(&ps->advertised_endpoint));
+				if (scope) {
+					JSON_SET_SIMPLE_CSTR("learned_endpoint",
+							ps->learned_endpoint.address.family
+							? endpoint_print_buf(&ps->learned_endpoint) : "");
+					JSON_SET_SIMPLE_CSTR("last_local_endpoint",
+							ps->last_local_endpoint.address.family
+							? endpoint_print_buf(&ps->last_local_endpoint) : "");
+					JSON_SET_SIMPLE("ep_detect_signal", "%" PRId64, ps->ep_detect_signal);
+					JSON_SET_SIMPLE("el_flags", "%u", ps->el_flags);
+					json_update_detected_endpoints(parser, inner, ps);
+				}
+				JSON_SET_SIMPLE("stats-packets","%" PRIu64, atomic64_get_na(&ps->stats_in->packets));
+				JSON_SET_SIMPLE("stats-bytes","%" PRIu64, atomic64_get_na(&ps->stats_in->bytes));
+				JSON_SET_SIMPLE("stats-errors","%" PRIu64, atomic64_get_na(&ps->stats_in->errors));
+
+				json_update_crypto_params(parser, inner, "", &ps->crypto.params);
+			}
+
+			snprintf(tmp, sizeof(tmp), "stream_sfds-%u", ps->unique_id);
+			inner = parser->dict_add_list_dup(root, tmp);
+			for (__auto_type k = ps->sfds.head; k; k = k->next) {
+				stream_fd *sfd = k->data;
+				JSON_ADD_LIST_STRING("%u", sfd->unique_id);
+			}
+
+			if (!scope) {
+				snprintf(tmp, sizeof(tmp), "rtp_sinks-%u", ps->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				for (__auto_type k = ps->rtp_sinks.head; k; k = k->next) {
+					struct sink_handler *sh = k->data;
+					struct packet_stream *sink = sh->sink;
+					JSON_ADD_LIST_STRING("%u", sink->unique_id);
+				}
+			}
+
+			if (!scope) {
+				snprintf(tmp, sizeof(tmp), "rtcp_sinks-%u", ps->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				for (__auto_type k = ps->rtcp_sinks.head; k; k = k->next) {
+					struct sink_handler *sh = k->data;
+					struct packet_stream *sink = sh->sink;
+					JSON_ADD_LIST_STRING("%u", sink->unique_id);
+				}
+			}
+		} // --- for streams.head
+
+		for (__auto_type l = c->monologues.head; l; l = l->next) {
+			struct call_monologue *ml = l->data;
+
+			if (!ml_in_scope(scope, ml))
+				continue;
+
+			snprintf(tmp, sizeof(tmp), "tag-%u", ml->unique_id);
+			inner = parser->dict_add_dict_dup(root, tmp);
+
+			{
+
+				JSON_SET_SIMPLE("created", "%" PRId64, ml->created_us);
+				JSON_SET_SIMPLE("deleted", "%" PRId64, ml->deleted_us);
+				JSON_SET_SIMPLE("block_dtmf", "%i", ml->block_dtmf);
+				JSON_SET_SIMPLE("ml_flags", "%" PRIu64, atomic64_get_na(&ml->ml_flags));
+				JSON_SET_SIMPLE_CSTR("desired_family", ml->desired_family ? ml->desired_family->rfc_name : "");
+				if (ml->logical_intf)
+					JSON_SET_SIMPLE_STR("logical_intf", &ml->logical_intf->name);
+
+				if (ml->tag.s)
+					JSON_SET_SIMPLE_STR("tag", &ml->tag);
+				if (ml->call_id.s)
+					JSON_SET_SIMPLE_STR("call_id", &ml->tag);
+				if (ml->viabranch.s)
+					JSON_SET_SIMPLE_STR("via-branch", &ml->viabranch);
+				if (ml->label.s)
+					JSON_SET_SIMPLE_STR("label", &ml->label);
+				if (ml->metadata.s)
+					JSON_SET_SIMPLE_STR("metadata", &ml->metadata);
+
+				JSON_SET_SIMPLE_STR("sdp_session_name", &ml->sdp_session_name);
+				JSON_SET_SIMPLE_STR("sdp_session_timing", &ml->sdp_session_timing);
+
+				if (ml->sdp_orig_in.parsed) {
+					JSON_SET_SIMPLE_STR("sdp_orig_username", &ml->sdp_orig_in.username);
+					JSON_SET_SIMPLE_STR("sdp_orig_session_id", &ml->sdp_orig_in.session_id);
+					JSON_SET_SIMPLE("sdp_orig_version_num", "%llu", ml->sdp_orig_in.version_num);
+					JSON_SET_SIMPLE("sdp_orig_parsed", "%u", ml->sdp_orig_in.parsed);
+					JSON_SET_SIMPLE_STR("sdp_orig_address_network_type", &ml->sdp_orig_in.address.network_type);
+					JSON_SET_SIMPLE_STR("sdp_orig_address_address_type", &ml->sdp_orig_in.address.address_type);
+					JSON_SET_SIMPLE_STR("sdp_orig_address_address", &ml->sdp_orig_in.address.address);
+				}
+				if (ml->sdp_orig_out.parsed) {
+					JSON_SET_SIMPLE_STR("last_sdp_orig_username", &ml->sdp_orig_out.username);
+					JSON_SET_SIMPLE_STR("last_sdp_orig_session_id", &ml->sdp_orig_out.session_id);
+					JSON_SET_SIMPLE("last_sdp_orig_version_num", "%llu", ml->sdp_orig_out.version_num);
+					JSON_SET_SIMPLE("last_sdp_orig_parsed", "%u", ml->sdp_orig_out.parsed);
+					JSON_SET_SIMPLE_STR("last_sdp_orig_address_network_type", &ml->sdp_orig_out.address.network_type);
+					JSON_SET_SIMPLE_STR("last_sdp_orig_address_address_type", &ml->sdp_orig_out.address.address_type);
+					JSON_SET_SIMPLE_STR("last_sdp_orig_address_address", &ml->sdp_orig_out.address.address);
+				}
+
+				if (ml->sdp_session_bandwidth.as >= 0)
+					JSON_SET_SIMPLE("sdp_session_as", "%ld", ml->sdp_session_bandwidth.as);
+				if (ml->sdp_session_bandwidth.ct >= 0)
+					JSON_SET_SIMPLE("sdp_session_ct", "%ld", ml->sdp_session_bandwidth.ct);
+				if (ml->sdp_session_bandwidth.rr >= 0)
+					JSON_SET_SIMPLE("sdp_session_rr", "%ld", ml->sdp_session_bandwidth.rr);
+				if (ml->sdp_session_bandwidth.rs >= 0)
+					JSON_SET_SIMPLE("sdp_session_rs", "%ld", ml->sdp_session_bandwidth.rs);
+				if (ml->sdp_session_bandwidth.tias >= 0)
+					JSON_SET_SIMPLE("sdp_session_tias", "%ld", ml->sdp_session_bandwidth.tias);
+				if (ml->last_out_sdp && ml->last_out_sdp->len)
+					JSON_SET_SIMPLE_LEN("last_out_sdp", ml->last_out_sdp->len,
+							ml->last_out_sdp->str);
+			}
+
+			GList *k = g_hash_table_get_values(ml->associated_tags);
+			if (!scope) {
+				snprintf(tmp, sizeof(tmp), "associated_tags-%u", ml->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				for (GList *m = k; m; m = m->next) {
+					struct call_monologue *ml2 = m->data;
+					JSON_ADD_LIST_STRING("%u", ml2->unique_id);
+				}
+			}
+
+			g_list_free(k);
+
+			if (!scope) {
+				snprintf(tmp, sizeof(tmp), "tag_aliases-%u", ml->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				for (__auto_type alias = ml->tag_aliases.head; alias; alias = alias->next)
+					JSON_ADD_LIST_STRING(STR_FORMAT, STR_FMT(alias->data));
+			}
+
+			snprintf(tmp, sizeof(tmp), "medias-%u", ml->unique_id);
+			inner = parser->dict_add_list_dup(root, tmp);
+			for (unsigned int j = 0; j < ml->medias->len; j++) {
+				struct call_media *media = ml->medias->pdata[j];
+				JSON_ADD_LIST_STRING("%u", media ? media->unique_id : -1);
+			}
+		} // --- for monologues.head
+
+		for (__auto_type l = c->medias.head; l; l = l->next) {
+			struct call_media *media = l->data;
+
+			if (!media || !ml_in_scope(scope, media->monologue))
+				continue;
+
+			if (!scope) {
+				/* store media subscriptions */
+				snprintf(tmp, sizeof(tmp), "media-subscriptions-%u", media->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+
+				IQUEUE_FOREACH(&media->media_subscriptions, ms) {
+					JSON_ADD_LIST_STRING("%u/%u/%u/%u/%u",
+							ms->media->unique_id,
+							ms->attrs.offer_answer,
+							ms->attrs.rtcp_only,
+							ms->attrs.egress,
+							ms->attrs.inject);
+				}
+			}
+
+			snprintf(tmp, sizeof(tmp), "media-%u", media->unique_id);
+			inner = parser->dict_add_dict_dup(root, tmp);
+
+			{
+				JSON_SET_SIMPLE("tag","%u", media->monologue->unique_id);
+				JSON_SET_SIMPLE("index","%u", media->index);
+				JSON_SET_SIMPLE_STR("type", &media->type);
+				if (media->format_str.s)
+					JSON_SET_SIMPLE_STR("format_str", &media->format_str);
+				if (media->media_id.s)
+					JSON_SET_SIMPLE_STR("media_id", &media->media_id);
+				JSON_SET_SIMPLE_CSTR("protocol", media->protocol ? media->protocol->name : "");
+				JSON_SET_SIMPLE_CSTR("desired_family", media->desired_family ? media->desired_family->rfc_name : "");
+				if (media->logical_intf)
+					JSON_SET_SIMPLE_STR("logical_intf", &media->logical_intf->name);
+				JSON_SET_SIMPLE("ptime","%i", media->ptime);
+				JSON_SET_SIMPLE("maxptime","%i", media->maxptime);
+				JSON_SET_SIMPLE("media_flags", "%" PRIu64, atomic64_get_na(&media->media_flags));
+
+				if (media->sdp_media_bandwidth.as >= 0)
+					JSON_SET_SIMPLE("bandwidth_as","%ld", media->sdp_media_bandwidth.as);
+				if (media->sdp_media_bandwidth.rr >= 0)
+					JSON_SET_SIMPLE("bandwidth_rr","%ld", media->sdp_media_bandwidth.rr);
+				if (media->sdp_media_bandwidth.rs >= 0)
+					JSON_SET_SIMPLE("bandwidth_rs","%ld", media->sdp_media_bandwidth.rs);
+				if (media->sdp_media_bandwidth.ct >= 0)
+					JSON_SET_SIMPLE("bandwidth_ct","%ld", media->sdp_media_bandwidth.ct);
+				if (media->sdp_media_bandwidth.tias >= 0)
+					JSON_SET_SIMPLE("bandwidth_tias","%ld", media->sdp_media_bandwidth.tias);
+
+				if (scope) {
+					if (media->tls_id.s)
+						JSON_SET_SIMPLE_STR("tls_id", &media->tls_id);
+					if (media->fp_hash_func)
+						JSON_SET_SIMPLE_CSTR("preferred_hash_func",
+								media->fp_hash_func->name);
+					if (media->endpoint_map)
+						JSON_SET_SIMPLE("endpoint_map", "%u",
+								media->endpoint_map->unique_id);
+
+					unsigned int num_cands = 0;
+					for (__auto_type m = media->ice_candidates.head; m; m = m->next)
+						num_cands++;
+					JSON_SET_SIMPLE("num_ice_candidates", "%u", num_cands);
+					JSON_SET_SIMPLE("had_ice", "%i", media->ice_agent ? 1 : 0);
+					if (media->ice_agent) {
+						JSON_SET_SIMPLE_STR("ice_ufrag_local", &media->ice_agent->ufrag[0]);
+						JSON_SET_SIMPLE_STR("ice_ufrag_remote", &media->ice_agent->ufrag[1]);
+						JSON_SET_SIMPLE_STR("ice_pwd_local", &media->ice_agent->pwd[0]);
+						JSON_SET_SIMPLE_STR("ice_pwd_remote", &media->ice_agent->pwd[1]);
+					}
+				}
+
+				redis_encode_sdes_params(parser, inner, "sdes_in", &media->sdes_in);
+				redis_encode_sdes_params(parser, inner, "sdes_out", &media->sdes_out);
+				redis_encode_dtls_fingerprint(parser, inner, &media->fingerprint);
+			}
+
+			if (scope) {
+				unsigned int ci = 0;
+				for (__auto_type m = media->ice_candidates.head; m; m = m->next, ci++) {
+					const struct ice_candidate *cand = m->data;
+					snprintf(tmp, sizeof(tmp), "ice_candidate-%u-%u", media->unique_id, ci);
+					inner = parser->dict_add_dict_dup(root, tmp);
+					JSON_SET_SIMPLE_STR("foundation", &cand->foundation);
+					JSON_SET_SIMPLE("component", "%lu", (unsigned long) cand->component_id);
+					JSON_SET_SIMPLE_CSTR("transport",
+							cand->transport ? cand->transport->name : "");
+					JSON_SET_SIMPLE("priority", "%lu", (unsigned long) cand->priority);
+					JSON_SET_SIMPLE("type", "%u", cand->type);
+					JSON_SET_SIMPLE_STR("ufrag", &cand->ufrag);
+					JSON_SET_SIMPLE_CSTR("endpoint",
+							cand->endpoint.address.family
+							? endpoint_print_buf(&cand->endpoint) : "");
+					JSON_SET_SIMPLE_CSTR("related",
+							cand->related.address.family
+							? endpoint_print_buf(&cand->related) : "");
+				}
+			}
+
+			if (!scope) {
+				snprintf(tmp, sizeof(tmp), "streams-%u", media->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				for (__auto_type m = media->streams.head; m; m = m->next) {
+					struct packet_stream *ps = m->data;
+					JSON_ADD_LIST_STRING("%u", ps->unique_id);
+				}
+			}
+
+			if (!scope) {
+				snprintf(tmp, sizeof(tmp), "maps-%u", media->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				for (__auto_type m = media->endpoint_maps.head; m; m = m->next) {
+					struct endpoint_map *ep = m->data;
+					JSON_ADD_LIST_STRING("%u", ep->unique_id);
+				}
+			}
+
+			snprintf(tmp, sizeof(tmp), "payload_types-%u", media->unique_id);
+			inner = parser->dict_add_list_dup(root, tmp);
+			redis_encode_codec_store(parser, inner, &media->codecs);
+
+			if (scope) {
+				snprintf(tmp, sizeof(tmp), "offered_payload_types-%u", media->unique_id);
+				inner = parser->dict_add_list_dup(root, tmp);
+				redis_encode_codec_store(parser, inner, &media->offered_codecs);
+			}
+
+			// SSRC table dump
+			// XXX needs fixing
+			LOCK(&media->ssrc_hash_in.lock);
+			snprintf(tmp, sizeof(tmp), "ssrc_table-%u", media->unique_id);
+			parser_arg list = parser->dict_add_list_dup(root, tmp);
+			for (GList *m = media->ssrc_hash_in.nq.head; m; m = m->next) {
+				struct ssrc_entry_call *se = m->data;
+				inner = parser->list_add_dict(list);
+
+				JSON_SET_SIMPLE("ssrc", "%" PRIu32, se->h.ssrc);
+				// XXX use function for in/out
+				JSON_SET_SIMPLE("in_srtp_index", "%u", atomic_get_na(&se->stats->ext_seq));
+				JSON_SET_SIMPLE("in_srtcp_index", "%u", atomic_get_na(&se->stats->rtcp_seq));
+				JSON_SET_SIMPLE("in_payload_type", "%i", se->tracker.most[0]);
+				//JSON_SET_SIMPLE("out_srtp_index", "%u", atomic_get_na(&se->output_ctx.stats->ext_seq));
+				//JSON_SET_SIMPLE("out_srtcp_index", "%u", atomic_get_na(&se->output_ctx.stats->rtcp_seq));
+				//JSON_SET_SIMPLE("out_payload_type", "%i", se->output_ctx.tracker.most[0]);
+				// XXX add rest of info
+			}
+		} // --- for medias.head
+
+		for (__auto_type l = scope ? NULL : c->endpoint_maps.head; l; l = l->next) {
+			struct endpoint_map *ep = l->data;
+
+			snprintf(tmp, sizeof(tmp), "map-%u", ep->unique_id);
+			inner = parser->dict_add_dict_dup(root, tmp);
+
+			{
+				JSON_SET_SIMPLE("wildcard","%i", ep->wildcard);
+				JSON_SET_SIMPLE("num_ports","%u", ep->num_ports);
+				JSON_SET_SIMPLE_CSTR("intf_preferred_family", ep->logical_intf->preferred_family->rfc_name);
+				JSON_SET_SIMPLE_STR("logical_intf", &ep->logical_intf->name);
+				JSON_SET_SIMPLE_CSTR("endpoint", endpoint_print_buf(&ep->endpoint));
+
+			}
+
+			snprintf(tmp, sizeof(tmp), "map_sfds-%u", ep->unique_id);
+			inner = parser->dict_add_list_dup(root, tmp);
+			for (__auto_type m = ep->intf_sfds.head; m; m = m->next) {
+				struct sfd_intf_list *il = m->data;
+				JSON_ADD_LIST_STRING("loc-%u", il->local_intf->unique_id);
+				for (__auto_type n = il->list.head; n; n = n->next) {
+					stream_fd *sfd = n->data;
+					JSON_ADD_LIST_STRING("%u", sfd->unique_id);
+				}
+			}
+		} // --- for c->endpoint_maps.head
+
+	}
+
+	return parser->collapse(ctx, root, to_free);
+}
+
+
+str redis_snapshot_encode(call_t *c, struct call_monologue *ml) {
+	struct call_monologue *scope[2] = { ml, ml };
+	ng_parser_ctx_t ctx;
+	bencode_buffer_t bbuf;
+	// never leaves the daemon, so the format is ours to pick
+	ng_parser_native.init(&ctx, &bbuf);
+
+	void *to_free = NULL;
+	str encoded = redis_encode_json(&ctx, c, &to_free, scope);
+	str out = STR_NULL;
+	if (encoded.len)
+		out = str_dup_str(&encoded);
+
+	g_free(to_free);
+	bencode_buffer_free(ctx.buffer);
+	return out;
+}
+
+void redis_snapshot_free(str *snap) {
+	str_free_dup(snap);
+}
+
+static stream_fd *snapshot_find_sfd(call_t *c, unsigned int id) {
+	for (__auto_type l = c->stream_fds.head; l; l = l->next) {
+		stream_fd *sfd = l->data;
+		if (sfd->unique_id == id)
+			return sfd;
+	}
+	return NULL;
+}
+
+static struct endpoint_map *snapshot_find_map(call_t *c, unsigned int id) {
+	for (__auto_type l = c->endpoint_maps.head; l; l = l->next) {
+		struct endpoint_map *map = l->data;
+		if (map->unique_id == id)
+			return map;
+	}
+	return NULL;
+}
+
+struct snapshot_sfd_iter {
+	call_t *call;
+	stream_fd_q *out;
+};
+
+static const char *snapshot_sfd_iter(str *val, unsigned int idx, helper_arg arg) {
+	struct snapshot_sfd_iter *args = arg.generic;
+	str *sid = redis_parser->unescape(val->s, val->len);
+	int id = str_to_i(sid, -1);
+	g_free(sid);
+	if (id < 0)
+		return NULL;
+	stream_fd *sfd = snapshot_find_sfd(args->call, (unsigned int) id);
+	if (!sfd)
+		return NULL;
+	stream_fd_inc(sfd);
+	t_queue_push_tail(args->out, sfd);
+	return NULL;
+}
+
+static void snapshot_apply_stream(call_t *c, struct packet_stream *ps,
+		const struct redis_hash *rh, parser_arg root)
+{
+	int64_t iv;
+	str s;
+
+	dtls_shutdown(ps);
+
+	int64_t sfd_id = -1;
+	redis_hash_get_int64_t(&sfd_id, rh, "sfd");
+	/* a socket that no longer exists, or was never bound here after a takeover:
+	 * keep the live binding, as restoring an unbound one would silence the call */
+	stream_fd *want_sfd = sfd_id >= 0 ? snapshot_find_sfd(c, (unsigned int) sfd_id) : NULL;
+	bool live_is_usable = ps->selected_sfd && ps->selected_sfd->socket.local.port;
+	bool want_is_usable = want_sfd && want_sfd->socket.local.port;
+
+	if (want_is_usable && want_sfd != ps->selected_sfd) {
+		char lkey[64];
+		snprintf(lkey, sizeof(lkey), "stream_sfds-%u", ps->unique_id);
+		parser_arg list = redis_parser->dict_get_expect(root, lkey, BENCODE_LIST);
+		stream_fd_q restored = TYPED_GQUEUE_INIT;
+		if (list.gen) {
+			struct snapshot_sfd_iter args = { .call = c, .out = &restored };
+			redis_parser->list_iter(redis_parser, list, snapshot_sfd_iter, NULL, &args);
+		}
+		if (!restored.length) {
+			stream_fd_inc(want_sfd);
+			t_queue_push_tail(&restored, want_sfd);
+		}
+		t_queue_clear_full(&ps->sfds, stream_fd_dec);
+		ps->sfds = restored;
+		ps->selected_sfd = want_sfd;
+	}
+	else if (!live_is_usable && want_sfd) {
+		ps->selected_sfd = want_sfd;
+	}
+
+	// propagated rather than ignored, so a malformed snapshot isn't applied piecemeal
+	if (redis_decode_stream_fields(ps, rh))
+		return;
+	if (!redis_hash_get_str(&s, rh, "learned_endpoint") && s.len)
+		redis_hash_get_endpoint(&ps->learned_endpoint, rh, "learned_endpoint");
+	if (!redis_hash_get_str(&s, rh, "last_local_endpoint") && s.len)
+		redis_hash_get_endpoint(&ps->last_local_endpoint, rh, "last_local_endpoint");
+
+	for (unsigned int i = 0; i < G_N_ELEMENTS(ps->detected_endpoints); i++) {
+		/* an absent endpoint is an empty string, which would parse as 0.0.0.0:0 */
+		if (!redis_hash_get_str_f(&s, rh, "detected_endpoint-%u", i) && s.len)
+			redis_hash_get_endpoint_f(&ps->detected_endpoints[i], rh,
+					"detected_endpoint-%u", i);
+		else
+			ZERO(ps->detected_endpoints[i]);
+	}
+
+	if (!redis_hash_get_int64_t(&iv, rh, "ep_detect_signal"))
+		ps->ep_detect_signal = iv;
+	if (!redis_hash_get_int64_t(&iv, rh, "el_flags"))
+		ps->el_flags = iv;
+
+	/* only recorded when a suite is in use, so an absent one means the rejected
+	 * offer's context has to go, or a plain-RTP media keeps SRTP configured */
+	if (redis_hash_get_str(&s, rh, "-crypto_suite"))
+		crypto_reset(&ps->crypto);
+}
+
+static void snapshot_apply_media_crypto(struct call_media *m, const struct redis_hash *rh) {
+	str s;
+
+	/* cleared first: the fingerprint decoder reports absence as success, and SDES appends */
+	crypto_params_sdes_queue_clear(&m->sdes_in);
+	crypto_params_sdes_queue_clear(&m->sdes_out);
+	redis_decode_sdes_params(&m->sdes_in, rh, "sdes_in");
+	redis_decode_sdes_params(&m->sdes_out, rh, "sdes_out");
+
+	if (!redis_hash_get_str(&s, rh, "hash_func"))
+		redis_decode_dtls_fingerprint(&m->fingerprint, rh);
+	else
+		ZERO(m->fingerprint);
+}
+
+static void snapshot_apply_media_codecs(struct call_media *m, parser_arg root) {
+	static const struct {
+		const char *key;
+		size_t offset;
+	} stores[] = {
+		{ "payload_types-%u",         G_STRUCT_OFFSET(struct call_media, codecs) },
+		{ "offered_payload_types-%u", G_STRUCT_OFFSET(struct call_media, offered_codecs) },
+	};
+
+	for (unsigned int i = 0; i < G_N_ELEMENTS(stores); i++) {
+		char key[64];
+		snprintf(key, sizeof(key), stores[i].key, m->unique_id);
+		parser_arg list = redis_parser->dict_get_expect(root, key, BENCODE_LIST);
+		if (!list.gen)
+			continue;
+		struct codec_store *cs = &G_STRUCT_MEMBER(struct codec_store, m, stores[i].offset);
+		codec_store_cleanup(cs);
+		codec_store_init(cs, m);
+		redis_decode_codec_store(redis_parser, list, cs);
+	}
+
+	codec_handlers_free(m);
+}
+
+static void snapshot_apply_media_ice(struct call_media *m, const struct redis_hash *rh,
+		parser_arg root)
+{
+	str s;
+	int64_t iv;
+
+	/* not rewound: applying the offer already reset the agent, so restoring the
+	 * accepted credentials lets connectivity checks rebuild the state */
+	int64_t had_ice = 0;
+	redis_hash_get_int64_t(&had_ice, rh, "had_ice");
+	if (!had_ice) {
+		ice_candidates_free(&m->ice_candidates);
+		ice_shutdown(&m->ice_agent);
+		return;
+	}
+
+	/* The agent keeps these, so they must outlive the hash they are read from. */
+	str ufrag[2] = {STR_NULL, STR_NULL}, pwd[2] = {STR_NULL, STR_NULL};
+	static const char *const ice_keys[4] = {
+		"ice_ufrag_local", "ice_ufrag_remote", "ice_pwd_local", "ice_pwd_remote",
+	};
+	str *ice_vals[4] = { &ufrag[0], &ufrag[1], &pwd[0], &pwd[1] };
+	for (unsigned int i = 0; i < G_N_ELEMENTS(ice_keys); i++) {
+		str raw;
+		if (!redis_hash_get_str(&raw, rh, ice_keys[i]))
+			*ice_vals[i] = call_str_cpy(&raw);
+	}
+
+	candidate_q cands = TYPED_GQUEUE_INIT;
+	int64_t num_cands = 0;
+	redis_hash_get_int64_t(&num_cands, rh, "num_ice_candidates");
+	for (int64_t i = 0; i < num_cands; i++) {
+		char ckey[64];
+		snprintf(ckey, sizeof(ckey), "ice_candidate-%u-%lld", m->unique_id, (long long) i);
+		struct redis_hash ch;
+		if (json_get_hash(&ch, ckey, -1, root))
+			continue;
+		struct ice_candidate *cand = g_new0(__typeof(*cand), 1);
+		if (!redis_hash_get_str(&s, &ch, "foundation"))
+			cand->foundation = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, &ch, "ufrag"))
+			cand->ufrag = call_str_cpy(&s);
+		if (!redis_hash_get_str(&s, &ch, "transport"))
+			cand->transport = get_socket_type(&s);
+		if (!redis_hash_get_int64_t(&iv, &ch, "component"))
+			cand->component_id = iv;
+		if (!redis_hash_get_int64_t(&iv, &ch, "priority"))
+			cand->priority = iv;
+		if (!redis_hash_get_int64_t(&iv, &ch, "type"))
+			cand->type = iv;
+		/* an absent endpoint is an empty string; parsing it would yield 0.0.0.0:0 */
+		if (!redis_hash_get_str(&s, &ch, "endpoint") && s.len)
+			redis_hash_get_endpoint(&cand->endpoint, &ch, "endpoint");
+		if (!redis_hash_get_str(&s, &ch, "related") && s.len)
+			redis_hash_get_endpoint(&cand->related, &ch, "related");
+		t_queue_push_tail(&cands, cand);
+		redis_hash_destroy(&ch);
+	}
+
+	/* the media keeps its own list too: it's what the record and any regenerated
+	 * SDP are built from, so restoring only the agent loses them */
+	ice_candidates_free(&m->ice_candidates);
+	for (__auto_type l = cands.head; l; l = l->next) {
+		struct ice_candidate *copy = g_new0(__typeof(*copy), 1);
+		*copy = *(struct ice_candidate *) l->data;
+		t_queue_push_tail(&m->ice_candidates, copy);
+	}
+	ice_agent_init(&m->ice_agent, m);
+	ice_rollback(m->ice_agent, ufrag, pwd, &cands);
+	ice_candidates_free(&cands);
+}
+
+static void snapshot_apply_media(call_t *c, struct call_media *m,
+		const struct redis_hash *rh, parser_arg root)
+{
+	int64_t iv;
+	str s;
+
+	if (redis_decode_media_fields(m, rh))
+		return;
+
+	// assigned unconditionally: these are written only when set, so an absent key
+	// means the rejected offer put it there and it has to go
+	m->protocol_str = !redis_hash_get_str(&s, rh, "protocol") ? call_str_cpy(&s) : STR_NULL;
+	m->tls_id = !redis_hash_get_str(&s, rh, "tls_id") ? call_str_cpy(&s) : STR_NULL;
+	m->fp_hash_func = !redis_hash_get_str(&s, rh, "preferred_hash_func")
+			? dtls_find_hash_func(&s) : NULL;
+	m->endpoint_map = !redis_hash_get_int64_t(&iv, rh, "endpoint_map")
+			? snapshot_find_map(c, (unsigned int) iv) : NULL;
+	m->sdp_media_bandwidth.ct = !redis_hash_get_int64_t(&iv, rh, "bandwidth_ct") ? iv : -1;
+	m->sdp_media_bandwidth.tias = !redis_hash_get_int64_t(&iv, rh, "bandwidth_tias") ? iv : -1;
+
+	// a media always has one, so fall back to the default rather than to nothing
+	if (redis_hash_get_str(&s, rh, "logical_intf")
+			|| !(m->logical_intf = get_logical_interface(&s, m->desired_family, 0)))
+		m->logical_intf = get_logical_interface(NULL, m->desired_family, 0);
+
+	if (!redis_hash_get_int64_t(&iv, rh, "media_flags"))
+		atomic64_set_na(&m->media_flags, (uint64_t) iv);
+
+	snapshot_apply_media_crypto(m, rh);
+
+	snapshot_apply_media_codecs(m, root);
+
+	snapshot_apply_media_ice(m, rh, root);
+}
+
+static void snapshot_apply_monologue(struct call_monologue *ml, const struct redis_hash *rh) {
+	int64_t iv;
+	str s;
+
+	redis_decode_monologue_sdp(ml, rh);
+
+	if (!redis_hash_get_str(&s, rh, "desired_family"))
+		ml->desired_family = get_socket_family_rfc(&s);
+	if (!redis_hash_get_str(&s, rh, "logical_intf")
+			&& !(ml->logical_intf = get_logical_interface(&s, ml->desired_family, 0)))
+		ml->logical_intf = get_logical_interface(NULL, ml->desired_family, 0);
+	if (!redis_hash_get_int64_t(&iv, rh, "ml_flags"))
+		atomic64_set_na(&ml->ml_flags, (uint64_t) iv);
+	if (ml->last_out_sdp)
+		g_string_free(ml->last_out_sdp, TRUE);
+	ml->last_out_sdp = !redis_hash_get_str(&s, rh, "last_out_sdp")
+		? g_string_new_len(s.s, s.len) : NULL;
+}
+
+static const char *snapshot_count_iter(str *val, unsigned int idx, helper_arg arg) {
+	unsigned int *n = arg.generic;
+	(*n)++;
+	return NULL;
+}
+
+static unsigned int snapshot_medias_len(struct call_monologue *ml, parser_arg root) {
+	char key[64];
+	snprintf(key, sizeof(key), "medias-%u", ml->unique_id);
+	parser_arg list = redis_parser->dict_get_expect(root, key, BENCODE_LIST);
+	if (!list.gen)
+		return ml->medias->len;
+	unsigned int n = 0;
+	redis_parser->list_iter(redis_parser, list, snapshot_count_iter, NULL, &n);
+	return n;
+}
+
+static void snapshot_apply_medias(call_t *c, struct call_monologue *ml, parser_arg root) {
+	for (unsigned int j = 0; j < ml->medias->len; j++) {
+		struct call_media *m = ml->medias->pdata[j];
+		struct redis_hash rh;
+		if (!m || json_get_hash(&rh, "media", m->unique_id, root))
+			continue;
+		snapshot_apply_media(c, m, &rh, root);
+		redis_hash_destroy(&rh);
+	}
+}
+
+static void snapshot_apply_monologues(struct call_monologue *ml, parser_arg root) {
+	struct redis_hash rh;
+	if (!json_get_hash(&rh, "tag", ml->unique_id, root)) {
+		snapshot_apply_monologue(ml, &rh);
+		redis_hash_destroy(&rh);
+	}
+	unsigned int keep = snapshot_medias_len(ml, root);
+	for (unsigned int j = keep; j < ml->medias->len; j++)
+		call_media_stop(ml->medias->pdata[j]);
+	if (keep < ml->medias->len)
+		t_ptr_array_set_size(ml->medias, keep);
+}
+
+static void snapshot_apply_streams(call_t *c, struct call_monologue *ml, parser_arg root) {
+	for (unsigned int j = 0; j < ml->medias->len; j++) {
+		struct call_media *m = ml->medias->pdata[j];
+		if (!m)
+			continue;
+		for (__auto_type l = m->streams.head; l; l = l->next) {
+			struct packet_stream *ps = l->data;
+			struct redis_hash rh;
+			if (json_get_hash(&rh, "stream", ps->unique_id, root))
+				continue;
+			snapshot_apply_stream(c, ps, &rh, root);
+			redis_hash_destroy(&rh);
+			__init_stream(ps);
+		}
+	}
+}
+
+bool redis_snapshot_apply(call_t *c, struct call_monologue *a, struct call_monologue *b) {
+	struct call_monologue *mls[2] = { a, b };
+	struct redis_parsed_record parsed[2] = {0};
+	parser_arg root[2] = {0};
+	bool live[2] = { false, false };
+	bool ok = false;
+
+	for (unsigned int i = 0; i < G_N_ELEMENTS(mls); i++) {
+		struct call_monologue *ml = mls[i];
+		if (!ml || !ml->checkpoint || !ml->checkpoint->pending)
+			continue;
+		if (!ml->checkpoint->snapshot.len)
+			continue;
+		if (redis_parse_record(&ml->checkpoint->snapshot, &root[i], &parsed[i]))
+			goto out;
+		live[i] = true;
+	}
+
+	if (!live[0] && !live[1])
+		goto out;
+
+	// order matters: monologues need the medias, subscriptions need the
+	// monologues, and initialising the streams needs both
+	for (unsigned int i = 0; i < G_N_ELEMENTS(mls); i++) {
+		if (!live[i])
+			continue;
+		redis_parser = parsed[i].parser;
+		snapshot_apply_medias(c, mls[i], root[i]);
+	}
+	for (unsigned int i = 0; i < G_N_ELEMENTS(mls); i++) {
+		if (!live[i])
+			continue;
+		redis_parser = parsed[i].parser;
+		snapshot_apply_monologues(mls[i], root[i]);
+	}
+
+	update_init_monologue_subscribers(a, OP_OFFER);
+	update_init_monologue_subscribers(b, OP_ANSWER);
+
+	for (unsigned int i = 0; i < G_N_ELEMENTS(mls); i++) {
+		if (!live[i])
+			continue;
+		redis_parser = parsed[i].parser;
+		snapshot_apply_streams(c, mls[i], root[i]);
+	}
+
+	for (unsigned int i = 0; i < G_N_ELEMENTS(mls); i++) {
+		if (!live[i])
+			continue;
+		redis_snapshot_free(&mls[i]->checkpoint->snapshot);
+		mls[i]->checkpoint->pending = false;
+	}
+	ok = true;
+
+out:
+	for (unsigned int i = 0; i < G_N_ELEMENTS(mls); i++)
+		redis_parsed_record_free(&parsed[i]);
+	return ok;
+}
+
+
+
+
+str call_serialize_state(call_t *c, void **to_free, bencode_buffer_t *bbuf) {
+	ng_parser_ctx_t ctx;
+	redis_format_parsers[rtpe_config.redis_format]->init(&ctx, bbuf);
+	return redis_encode_json(&ctx, c, to_free, NULL);
+}

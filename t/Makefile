@@ -387,6 +387,7 @@ test-stats:	test-stats.o \
 	../daemon/call_flags.strhash.o \
 	../daemon/call_interfaces.o \
 	../daemon/call.o \
+	../daemon/call_state.o \
 	../daemon/cdr.o \
 	../daemon/cli.strhash.o \
 	../daemon/codec.o \
@@ -450,6 +451,7 @@ test-transcode:	test-transcode.o \
 	../daemon/call_flags.strhash.o \
 	../daemon/call_interfaces.o \
 	../daemon/call.o \
+	../daemon/call_state.o \
 	../daemon/cdr.o \
 	../daemon/cli.strhash.o \
 	../daemon/codec.o \
