@@ -97,6 +97,7 @@ enum endpoint_learning {
 	X(ng_client_retries) \
 	X(http_buf_size) \
 	X(http_keepalive_timeout) \
+	X(tarantool_expires_secs) \
 
 #define RTPE_CONFIG_INT64_PARAMS \
 	X(bw_limit) \
@@ -150,6 +151,9 @@ enum endpoint_learning {
 	X(redis_hostname) \
 	X(redis_write_hostname) \
 	X(redis_subscribe_hostname) \
+	X(tarantool_auth) \
+	X(tarantool_space) \
+	X(tarantool_node_id) \
 	X(moh_attr_name) \
 	X(spooldir) \
 	X(rec_method) \
@@ -185,6 +189,8 @@ enum endpoint_learning {
 	X(redis_ep) \
 	X(redis_write_ep) \
 	X(redis_subscribe_ep) \
+	X(tarantool_ep) \
+	X(tarantool_write_ep) \
 	X(homer_ep) \
 	X(dtmf_udp_ep)
 

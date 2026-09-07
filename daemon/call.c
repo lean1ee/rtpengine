@@ -19,6 +19,21 @@
 #include "control_tcp.h"
 #include "streambuf.h"
 #include "redis.h"
+#include "tarantool.h"
+
+static inline void call_state_sync_update(call_t *c) {
+	if (rtpe_redis_write)
+		redis_update_onekey(c, rtpe_redis_write);
+	if (rtpe_tarantool_write)
+		tarantool_update_onekey(c, rtpe_tarantool_write);
+}
+
+static inline void call_state_sync_delete(call_t *c) {
+	if (rtpe_redis_write)
+		redis_delete(c, rtpe_redis_write);
+	if (rtpe_tarantool_write)
+		tarantool_delete(c, rtpe_tarantool_write);
+}
 #include "str.h"
 #include "stun.h"
 #include "rtcp.h"
@@ -102,7 +117,7 @@ static void call_timer_delete_monologues(call_t *c) {
 
 	rwlock_unlock_w(&c->master_lock);
 	if (update)
-		redis_update_onekey(c, rtpe_redis_write);
+		call_state_sync_update(c);
 	rwlock_lock_r(&c->master_lock);
 
 	// coverity[missing_unlock : FALSE]
@@ -303,7 +318,7 @@ out:
 	rwlock_unlock_r(&c->master_lock);
 
 	if (do_update)
-		redis_update_onekey(c, rtpe_redis_write);
+		call_state_sync_update(c);
 
 	log_info_pop();
 }
@@ -5256,7 +5271,7 @@ void call_destroy(call_t *c) {
 	statistics_update_ip46_inc_dec(c, CMC_DECREMENT);
 	statistics_update_foreignown_dec(c);
 
-	redis_delete(c, rtpe_redis_write);
+	call_state_sync_delete(c);
 
 	__call_iterator_remove(c);
 
@@ -6474,7 +6489,7 @@ static int call_do_delete_full(call_t *c, int64_t delete_delay) {
 		c->deleted_us = rtpe_now + delete_delay;
 		rwlock_unlock_w(&c->master_lock);
 
-		redis_update_onekey(c, rtpe_redis_write);
+		call_state_sync_update(c);
 	}
 	else {
 		ilog(LOG_INFO, "Deleting entire call");
@@ -6541,7 +6556,7 @@ static int call_delete_monologue(call_t *c, const str *callid, struct call_monol
 
 	rwlock_unlock_w(&c->master_lock);
 
-	redis_update_onekey(c, rtpe_redis_write);
+	call_state_sync_update(c);
 	obj_release(c);
 
 	return 0;
@@ -6566,7 +6581,7 @@ static int call_delete_by_id(call_t *c, const str *callid, ng_command_ctx_t *ctx
 
 	rwlock_unlock_w(&c->master_lock);
 
-	redis_update_onekey(c, rtpe_redis_write);
+	call_state_sync_update(c);
 	obj_release(c);
 
 	return 0;

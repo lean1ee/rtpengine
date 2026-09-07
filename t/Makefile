@@ -420,6 +420,7 @@ test-stats:	test-stats.o \
 	../daemon/statistics.o \
 	../daemon/stun.o \
 	../daemon/t38.o \
+	../daemon/tarantool.o \
 	../daemon/tcp_listener.o \
 	../daemon/timerthread.o \
 	../daemon/udp_listener.o \
@@ -483,6 +484,7 @@ test-transcode:	test-transcode.o \
 	../daemon/statistics.o \
 	../daemon/stun.o \
 	../daemon/t38.o \
+	../daemon/tarantool.o \
 	../daemon/tcp_listener.o \
 	../daemon/timerthread.o \
 	../daemon/udp_listener.o \

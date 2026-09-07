@@ -689,6 +689,68 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     number of keepalive probes that are sent before the connection is deemed
     dead. The defaults are 1 and 3 respectively.
 
+- __-T__, __\-\-tarantool=__\[*USER*:*PW*@\]*IP*:*PORT*
+
+    Connect to specified Tarantool 3.x database instance for active call media state
+    synchronization and clustering over binary IProto protocol. Unlike Redis BGSAVE snapshots,
+    Tarantool utilizes streaming Write-Ahead Logging (WAL), eliminating Linux Copy-on-Write
+    latency spikes (18 ms) and guaranteeing zero RTP audio jitter.
+
+    Requires space `rtpe_calls` (ID: 512) and secondary indexes (`by_node`, `by_expire`).
+    Ready-to-use Docker images and Lua server schema templates are available at:
+    `https://github.com/lean1ee/tarantool-voip-backend`
+
+- __\-\-tarantool-write=__\[*USER*:*PW*@\]*IP*:*PORT*
+
+    Configures a secondary or write-master Tarantool instance.
+
+- __\-\-tarantool-node-id=__*STRING*
+
+    Unique media node identifier (e.g. `rtpe-node-01`). Used for O(log N) secondary index
+    lookup and instant failover recovery when adopting call legs from a failed node.
+
+- __\-\-tarantool-space=__*STRING*|*INT*
+
+    Target in-memory space for active call records (default: `rtpe_calls` or `512`).
+
+- __\-\-tarantool-num-threads=__*INT*
+
+    Number of worker threads allocated for async Tarantool IProto communication (default: `4`).
+
+- __\-\-tarantool-expires=__*INT*
+
+    Call session expiration TTL in seconds (default: `3600`).
+
+- __\-\-no-tarantool-required__
+
+    Allow rtpengine to start even if the initial Tarantool connection cannot be established.
+
+- __\-\-tarantool-allowed-errors=__*INT*
+
+    Number of consecutive errors before temporarily disabling Tarantool connection (default: `3`).
+
+- __\-\-tarantool-disable-time=__*INT*
+
+    Number of seconds to disable Tarantool communication after error threshold (default: `10`).
+
+- __\-\-tarantool-cmd-timeout=__*INT*
+
+    Command timeout in milliseconds (default: `500`).
+
+- __\-\-tarantool-connect-timeout=__*INT*
+
+    Connection timeout in milliseconds (default: `500`).
+
+- __\-\-tarantool-resolve-on-reconnect__
+
+    Re-resolve hostnames via DNS on reconnection attempts.
+
+- __\-\-tarantool-tcp-keepalive-time=__*INT*
+- __\-\-tarantool-tcp-keepalive-intvl=__*INT*
+- __\-\-tarantool-tcp-keepalive-probes=__*INT*
+
+    Controls TCP keepalive behavior on IProto connections to Tarantool.
+
 - __-b__, __\-\-b2b-url=__*STRING*
 
     Enables and sets the URI for an XMLRPC callback to be made when a call is

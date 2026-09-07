@@ -61,6 +61,7 @@
 #include "bufferpool.h"
 #include "uring.h"
 #include "ng_client.h"
+#include "tarantool.h"
 
 
 
@@ -717,6 +718,8 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	g_autoptr(char) redisps = NULL;
 	g_autoptr(char) redisps_write = NULL;
 	g_autoptr(char) redisps_subscribe = NULL;
+	g_autoptr(char) tarantoolps = NULL;
+	g_autoptr(char) tarantoolps_write = NULL;
 	g_autoptr(char) log_facility_cdr_s = NULL;
 	g_autoptr(char) log_facility_rtcp_s = NULL;
 	g_autoptr(char) log_facility_dtmf_s = NULL;
@@ -822,6 +825,10 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "redis-tcp-keepalive-time",0,0,G_OPTION_ARG_INT,&rtpe_config.redis_tcp_keepalive_time,"Positive value sets tcp_keepalive_time for redis connections", "INT" },
 		{ "redis-tcp-keepalive-intvl",0,0,G_OPTION_ARG_INT,&rtpe_config.redis_tcp_keepalive_intvl,"Set tcp_keepalive_intvl for redis connections", "INT" },
 		{ "redis-tcp-keepalive-probes",0,0,G_OPTION_ARG_INT,&rtpe_config.redis_tcp_keepalive_probes,"Set tcp_keepalive_probes for redis connections", "INT" },
+		{ "tarantool", 0, 0, G_OPTION_ARG_STRING, &tarantoolps, "Connect to Tarantool database", "IP46|HOSTNAME:PORT" },
+		{ "tarantool-write", 0, 0, G_OPTION_ARG_STRING, &tarantoolps_write, "Connect to Tarantool write database", "IP46|HOSTNAME:PORT" },
+		{ "tarantool-space", 0, 0, G_OPTION_ARG_STRING, &rtpe_config.tarantool_space, "Tarantool space name for calls (default: rtpe_calls)", "STRING" },
+		{ "tarantool-expires", 0, 0, G_OPTION_ARG_INT, &rtpe_config.tarantool_expires_secs, "Expire time in seconds for Tarantool records", "INT" },
 
 #if 0
 		// temporarily disabled, see discussion on https://github.com/sipwise/rtpengine/commit/2ebf5a1526c1ce8093b3011a1e23c333b3f99400
@@ -1308,6 +1315,15 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 						&rtpe_config.redis_subscribe_auth,"RTPENGINE_REDIS_SUBSCRIBE_AUTH_PW", redisps_subscribe))
 				die("Invalid Redis endpoint [IP:PORT/INT] '%s' (--redis-subscribe)", redisps_subscribe);
 		}
+
+	if (tarantoolps) {
+		if (!endpoint_parse_any_getaddrinfo_full(&rtpe_config.tarantool_ep, tarantoolps))
+			die("Invalid Tarantool endpoint [IP:PORT] '%s' (--tarantool)", tarantoolps);
+	}
+	if (tarantoolps_write) {
+		if (!endpoint_parse_any_getaddrinfo_full(&rtpe_config.tarantool_write_ep, tarantoolps_write))
+			die("Invalid Tarantool write endpoint [IP:PORT] '%s' (--tarantool-write)", tarantoolps_write);
+	}
 
 	if (rtpe_config.fmt < 0 || rtpe_config.fmt > 2)
 		die("Invalid XMLRPC format");
@@ -1963,6 +1979,26 @@ static void create_everything(void) {
 			rtpe_redis_write = rtpe_redis;
 	}
 
+	if (!is_addr_unspecified(&rtpe_config.tarantool_ep.address)) {
+		rtpe_tarantool = tarantool_new(&rtpe_config.tarantool_ep,
+				rtpe_config.tarantool_auth,
+				"",
+				"rtpe-default",
+				rtpe_config.tarantool_space ? rtpe_config.tarantool_space : "rtpe_calls");
+		if (!rtpe_tarantool)
+			ilog(LOG_WARN, "Failed to connect to Tarantool database %s", endpoint_print_buf(&rtpe_config.tarantool_ep));
+
+		if (!is_addr_unspecified(&rtpe_config.tarantool_write_ep.address)) {
+			rtpe_tarantool_write = tarantool_new(&rtpe_config.tarantool_write_ep,
+					rtpe_config.tarantool_auth,
+					"",
+					"rtpe-default",
+					rtpe_config.tarantool_space ? rtpe_config.tarantool_space : "rtpe_calls");
+		} else {
+			rtpe_tarantool_write = rtpe_tarantool;
+		}
+	}
+
 	daemonize();
 	wpidfile();
 
@@ -2037,6 +2073,20 @@ static void do_redis_restore(void) {
 	// print redis restore duration
 	redis_diff += redis_stop - redis_start;
 	ilog(LOG_INFO, "Redis restore time = %.0lf ms", redis_diff / 1000.0);
+}
+
+static void do_tarantool_restore(void) {
+	if (!rtpe_tarantool)
+		return;
+
+	int64_t tnt_start = now_us();
+	ilog(LOG_INFO, "Restoring calls from Tarantool database...");
+
+	if (tarantool_restore(rtpe_tarantool, false))
+		ilog(LOG_WARN, "Unable to restore calls from Tarantool");
+
+	double tnt_diff = now_us() - tnt_start;
+	ilog(LOG_INFO, "Tarantool restore time = %.0lf ms", tnt_diff / 1000.0);
 }
 
 
@@ -2125,6 +2175,7 @@ int main(int argc, char **argv) {
 		thread_create_detach(redis_notify_loop, NULL, "redis notify");
 
 	do_redis_restore();
+	do_tarantool_restore();
 
 	if (graphite_is_enabled())
 		thread_create_detach(graphite_loop, NULL, "graphite");
@@ -2218,6 +2269,12 @@ int main(int argc, char **argv) {
 	if (rtpe_redis_write != rtpe_redis)
 		redis_close(rtpe_redis_write);
 	redis_close(rtpe_redis_notify);
+
+	if (rtpe_tarantool) {
+		tarantool_close(rtpe_tarantool);
+		if (rtpe_tarantool_write && rtpe_tarantool_write != rtpe_tarantool)
+			tarantool_close(rtpe_tarantool_write);
+	}
 
 	free_prefix();
 	log_free();
